@@ -1,5 +1,5 @@
 # Forecasting Consumer Price Index Data
-This project explores statistical methods for time series analysis and forecasting of economic data. Our analysis focuses on the Consumer Price Index (CPI), as well as how it is influenced by 
+This project explores statistical methods for time series analysis and forecasting of economic data. Our analysis focuses on the Consumer Price Index (CPI), as well as how it is influenced by the Federal Reserve Funds Rate, Producer Price Index, Housing Index, and Unemployment Rate.
 
 ## Models:
 - Univariate ARIMA
