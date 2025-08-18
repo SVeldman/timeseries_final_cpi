@@ -1,0 +1,1014 @@
+---
+title: "Time Series Analysis - Final Project - Champion Model Cross-Validation"
+author: "Steve Veldman"
+date: "August 17, 2025"
+output: 
+  html_document:
+    toc: false
+    theme: cosmo
+    highlight: tango
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+library(tidyverse)
+library(forecast)
+library(tseries)
+library(lubridate)
+library(TSA)
+library(readxl)
+library(stringr)
+library(zoo)
+library(moments)
+library(vars)
+```
+
+### **Background**
+**This file conducts model cross-validation for the final/champion VAR model.**  
+  
+#### **Data Processing**
+```{r load_data}
+# Load the data
+data <- read.csv("combined_time_series.csv")
+
+# Convert Date column to proper date format
+data$Date <- as.Date(data$Date)
+```
+
+```{r CPI_Stationarity}
+# Log transform CPI 
+log_CPI <- log(data$CPI)
+
+# First difference Log(CPI)
+diff_log_cpi <- diff(log_CPI)
+
+cpi_final_series <- diff_log_cpi
+cpi_final_name <- "Δ(Log(CPI)) [Inflation Rate]"
+```
+
+```{r FedFunds_Stationarity}
+# First difference Fed Funds to handle random walk behavior
+diff_FedFunds <- diff(data$FedFunds)
+
+fedfunds_final_series <- diff_FedFunds
+fedfunds_final_name <- "Δ(Fed Funds) [Policy Change]"
+```
+
+```{r PPI_Stationarity}
+# Box-Cox transformation with optimal lambda
+lambda <- BoxCox.lambda(data$PPI)
+ppi_bc_transform <- BoxCox(data$PPI, lambda = lambda)
+
+# First difference of Box-Cox transformed PPI
+ppi_bc_diff <- diff(ppi_bc_transform)
+
+ppi_final_series <- ppi_bc_diff
+ppi_final_name <- "Δ(PPI) [Producer Price Index]"
+```
+
+```{r Housing_Stationarity}
+# Box-Cox transformation with auto lambda for Housing Index
+lambda <- BoxCox.lambda(data$HousingIndex)
+housing_bc_transform <- BoxCox(data$HousingIndex, lambda = "auto")
+
+# First difference of Box-Cox transformed Housing Index
+housing_bc_diff <- diff(housing_bc_transform)
+
+# Second difference of Box-Cox transformed Housing Index
+housing_bc_diff_2 <- diff(housing_bc_diff)
+
+housing_final_series <- housing_bc_diff_2
+housing_final_name <- "Δ²(Housing) [Housing Index]"
+```
+
+```{r baseline_and_champion_dataframes}
+# Create a data frame with the final stationary series
+final_data_baseline <- data.frame(
+  Date = data$Date[-1],
+  CPI = cpi_final_series,
+  FedFunds = fedfunds_final_series
+)
+
+# For champion model, align all series to the shortest length (Housing uses 2nd difference)
+# Housing final series has length n-2, so we need to align other series
+min_length <- length(housing_final_series)  # This will be 418 (n-2)
+
+final_data_champion <- data.frame(
+  Date = data$Date[-(1:2)],  # Remove first 2 observations to match Housing
+  CPI = tail(cpi_final_series, min_length),  # Take last min_length observations
+  FedFunds = tail(fedfunds_final_series, min_length),
+  PPI = tail(ppi_final_series, min_length),
+  Housing = housing_final_series
+)
+
+```
+
+
+#### **Train/Test Split**
+
+```{r train_test_split}
+# ============================================================================
+# TRAIN/TEST SPLIT - Training up to December 2023, Test from January 2024
+# ============================================================================
+
+# Split the transformed, stationary data into training and test sets
+# Training: All data up to and including December 2023
+# Test: All observations from January 2024 onwards
+split_date <- as.Date("2023-12-31")
+
+# Find the index where we split the data (using baseline data for reference)
+split_index <- which(final_data_baseline$Date <= split_date)
+if(length(split_index) == 0) {
+  cat("ERROR: No data found before or on December 31, 2023\n")
+  cat("Available date range:", as.character(range(final_data_baseline$Date)), "\n")
+  stop("Cannot proceed with train/test split")
+}
+
+# Get the last training observation index
+last_train_index <- max(split_index)
+
+# Split the data
+train_data_baseline <- final_data_baseline[1:last_train_index, ]
+train_data_champion <- final_data_champion[1:last_train_index, ]
+test_data_baseline <- final_data_baseline[(last_train_index + 1):nrow(final_data_baseline), ]
+test_data_champion <- final_data_champion[(last_train_index + 1):nrow(final_data_champion), ]
+
+```
+
+```{r ts_objects}
+# Create time series objects for VAR analysis using TRAINING DATA ONLY
+ts_train_baseline <- ts(train_data_baseline[, c("CPI", "FedFunds")],
+               start = c(1990, 2), frequency = 12)
+
+ts_train_champion <- ts(train_data_champion[, c("CPI", "FedFunds", "PPI", "Housing")],
+               start = c(1990, 2), frequency = 12)
+```
+
+#### **Intervention Variable**
+```{r intervention_variable}
+# INTERVENTION VARIABLE DEFINITION
+
+# Define COVID-19 intervention period dates
+intervention_start <- as.Date("2020-12-01")
+intervention_end <- as.Date("2022-05-01")
+
+# Based on visual analysis and economic events, define intervention period
+intervention_start_date <- "2020-12"
+intervention_end_date <- "2022-05"
+
+# Create intervention variable for the defined period
+intervention_start_num <- as.numeric(as.yearmon(intervention_start_date))
+intervention_end_num <- as.numeric(as.yearmon(intervention_end_date))
+time_indices <- as.numeric(time(ts_train_champion))
+
+# step intervention variable: 1 during intervention period, 0 otherwise
+intervention <- ifelse(time_indices >= intervention_start_num & time_indices <= intervention_end_num, 1, 0)
+
+```
+
+
+### **Cross Validation** 
+#### **Step 1 - Non-Intervention Models Over Full Training Set** 
+```{r cv_step_1}
+# ============================================================================
+# CROSS-VALIDATION FOR VAR CHAMPION MODEL WITH CPI, FEDFUNDS, PPI, HOUSING
+# ============================================================================
+# Testing champion model with CPI, Fed Funds, PPI, and Housing Index
+# 20-year sliding window, 1-month steps, 12-month forecast horizon
+# ============================================================================
+
+# Set up parameters
+k <- 240  # train_window_size: 20 years = 240 months
+s <- 1    # 1-month steps
+H <- 12    # 12-month forecast horizon
+n <- nrow(ts_train_champion) # Get the total number of observations in training data
+p <- 12 # Period
+# Get start time of the series
+st <- tsp(ts_train_champion)[1]+(k-2)/p # gives the start time in time units
+
+# Define intervention period (COVID-19: Dec 2020 - May 2022)
+intervention_start <- as.yearmon("2020-12")
+intervention_end <- as.yearmon("2022-05")
+
+cat("Using champion VAR model (no intervention) for cross-validation\n")
+
+# ============================================================================
+# INITIALIZE STORAGE FOR RESULTS
+# ============================================================================
+
+# Calculate exact number of iterations
+# We need H observations for test set, so last valid iteration is when we can get full test set
+max_iterations <- n - k - H + 1
+cat("Calculated iterations:", max_iterations, "\n")
+
+# Initialize matrices for storing results  
+mae_champion_cpi <- matrix(NA, max_iterations, H)
+rmse_champion_cpi <- matrix(NA, max_iterations, H)
+mae_champion_fedfunds <- matrix(NA, max_iterations, H)
+rmse_champion_fedfunds <- matrix(NA, max_iterations, H)
+mae_champion_ppi <- matrix(NA, max_iterations, H)
+rmse_champion_ppi <- matrix(NA, max_iterations, H)
+mae_champion_housing <- matrix(NA, max_iterations, H)
+rmse_champion_housing <- matrix(NA, max_iterations, H)
+aic_champion <- numeric(max_iterations)
+bic_champion <- numeric(max_iterations)
+adj_r2_champion_cpi <- numeric(max_iterations)
+adj_r2_champion_fedfunds <- numeric(max_iterations)
+adj_r2_champion_ppi <- numeric(max_iterations)
+adj_r2_champion_housing <- numeric(max_iterations)
+
+```
+
+```{r step_1_loop}
+for(i in 1:max_iterations)
+{
+  # Sliding Window - keep the training window of fixed length
+  train <- window(ts_train_champion, start=st+(i-k+1)/p, end=st+i/p) ## Window Length: k
+  
+  test <- window(ts_train_champion, start=st + (i+1)/p, end=st + (i+H)/p) ## Window Length: H
+  
+  # Fit champion VAR model (no intervention)
+  fit_champion <- VAR(train, p = 3, type = "const", season = 12)
+  fcast_champion <- predict(fit_champion, n.ahead = H)
+  
+  # Calculate errors for all four variables
+  # Extract forecasts for all variables
+  fcast_cpi <- as.numeric(fcast_champion[['fcst']][[1]][,1])      # CPI forecasts
+  fcast_fedfunds <- as.numeric(fcast_champion[['fcst']][[2]][,1]) # FedFunds forecasts
+  fcast_ppi <- as.numeric(fcast_champion[['fcst']][[3]][,1])      # PPI forecasts
+  fcast_housing <- as.numeric(fcast_champion[['fcst']][[4]][,1])  # Housing forecasts
+  test_cpi <- as.numeric(test[,1])       # CPI test data
+  test_fedfunds <- as.numeric(test[,2])  # FedFunds test data
+  test_ppi <- as.numeric(test[,3])       # PPI test data
+  test_housing <- as.numeric(test[,4])   # Housing test data
+  
+  # Store forecast errors for all four variables
+  mae_champion_cpi[i,] <- abs(fcast_cpi - test_cpi)
+  rmse_champion_cpi[i,] <- (fcast_cpi - test_cpi)^2
+  mae_champion_fedfunds[i,] <- abs(fcast_fedfunds - test_fedfunds)
+  rmse_champion_fedfunds[i,] <- (fcast_fedfunds - test_fedfunds)^2
+  mae_champion_ppi[i,] <- abs(fcast_ppi - test_ppi)
+  rmse_champion_ppi[i,] <- (fcast_ppi - test_ppi)^2
+  mae_champion_housing[i,] <- abs(fcast_housing - test_housing)
+  rmse_champion_housing[i,] <- (fcast_housing - test_housing)^2
+
+  # Store AIC and BIC values for champion model
+  aic_champion[i] <- AIC(fit_champion)
+  bic_champion[i] <- BIC(fit_champion)
+  
+  # Calculate adjusted R² for each variable equation
+  adj_r2_champion_cpi[i] <- summary(fit_champion)$varresult[[1]]$adj.r.squared
+  adj_r2_champion_fedfunds[i] <- summary(fit_champion)$varresult[[2]]$adj.r.squared
+  adj_r2_champion_ppi[i] <- summary(fit_champion)$varresult[[3]]$adj.r.squared
+  adj_r2_champion_housing[i] <- summary(fit_champion)$varresult[[4]]$adj.r.squared
+
+}
+
+# Summary of cross-validation results
+cat("Champion VAR cross-validation completed successfully!\n")
+cat("Training window:", k/12, "years | Forecast horizon:", H, "months | Iterations:", max_iterations, "\n")
+cat("Mean AIC:", round(mean(aic_champion), 2), "| Mean BIC:", round(mean(bic_champion), 2), "\n")
+cat("Mean Adj R² - CPI:", round(mean(adj_r2_champion_cpi), 3), "| FedFunds:", round(mean(adj_r2_champion_fedfunds), 3), "\n")
+cat("Mean Adj R² - PPI:", round(mean(adj_r2_champion_ppi), 3), "| Housing:", round(mean(adj_r2_champion_housing), 3), "\n")
+```
+
+```{r step_1mean_metrics}
+# Calculate mean MAE and RMSE across iterations for each horizon and variable
+mean_mae_champion_cpi <- colMeans(mae_champion_cpi, na.rm=TRUE)
+mean_rmse_champion_cpi <- sqrt(colMeans(rmse_champion_cpi, na.rm=TRUE))
+mean_mae_champion_fedfunds <- colMeans(mae_champion_fedfunds, na.rm=TRUE)
+mean_rmse_champion_fedfunds <- sqrt(colMeans(rmse_champion_fedfunds, na.rm=TRUE))
+mean_mae_champion_ppi <- colMeans(mae_champion_ppi, na.rm=TRUE)
+mean_rmse_champion_ppi <- sqrt(colMeans(rmse_champion_ppi, na.rm=TRUE))
+mean_mae_champion_housing <- colMeans(mae_champion_housing, na.rm=TRUE)
+mean_rmse_champion_housing <- sqrt(colMeans(rmse_champion_housing, na.rm=TRUE))
+
+# Calculate mean AIC, BIC, and Adj R² values
+mean_aic_champion <- mean(aic_champion, na.rm=TRUE)
+mean_bic_champion <- mean(bic_champion, na.rm=TRUE)
+mean_adj_r2_cpi <- mean(adj_r2_champion_cpi, na.rm=TRUE)
+mean_adj_r2_fedfunds <- mean(adj_r2_champion_fedfunds, na.rm=TRUE)
+mean_adj_r2_ppi <- mean(adj_r2_champion_ppi, na.rm=TRUE)
+mean_adj_r2_housing <- mean(adj_r2_champion_housing, na.rm=TRUE)
+```
+
+```{r step_1_plots}
+# Create plots - Champion VAR Models (Lag 3)
+
+par(mfrow=c(3,3))
+
+# Row 1: MAE vs forecast horizon for all four variables
+plot(1:H, mean_mae_champion_cpi, type="l", col="blue", lwd=2, 
+     main="MAE vs Forecast Horizon", xlab="Horizon", ylab="MAE",
+     ylim=range(c(mean_mae_champion_cpi, mean_mae_champion_fedfunds, mean_mae_champion_ppi, mean_mae_champion_housing)))
+lines(1:H, mean_mae_champion_fedfunds, col="red", lwd=2)
+lines(1:H, mean_mae_champion_ppi, col="green", lwd=2)
+lines(1:H, mean_mae_champion_housing, col="purple", lwd=2)
+
+# Row 1: RMSE vs forecast horizon for all four variables
+plot(1:H, mean_rmse_champion_cpi, type="l", col="blue", lwd=2,
+     main="RMSE vs Forecast Horizon", xlab="Horizon", ylab="RMSE",
+     ylim=range(c(mean_rmse_champion_cpi, mean_rmse_champion_fedfunds, mean_rmse_champion_ppi, mean_rmse_champion_housing)))
+lines(1:H, mean_rmse_champion_fedfunds, col="red", lwd=2)
+lines(1:H, mean_rmse_champion_ppi, col="green", lwd=2)
+lines(1:H, mean_rmse_champion_housing, col="purple", lwd=2)
+
+# Row 1: Leave blank (placeholder)
+plot.new()
+
+# Row 2: AIC vs iteration number with upper bound label
+plot(seq_along(aic_champion), aic_champion, type="l", col="green", lwd=2,
+     main="AIC vs Iteration - Champion VAR", xlab="Iteration", ylab="AIC")
+text(length(aic_champion) * 0.8, max(aic_champion, na.rm=TRUE) * 0.95, 
+     paste("Max:", round(max(aic_champion, na.rm=TRUE), 1)), adj=0, cex=0.8)
+
+# Row 2: BIC vs iteration number with upper bound label
+plot(seq_along(bic_champion), bic_champion, type="l", col="orange", lwd=2,
+     main="BIC vs Iteration - Champion VAR", xlab="Iteration", ylab="BIC")
+text(length(bic_champion) * 0.8, max(bic_champion, na.rm=TRUE) * 0.95, 
+     paste("Max:", round(max(bic_champion, na.rm=TRUE), 1)), adj=0, cex=0.8)
+
+# Row 2: Legend for all plots - formatted to show all variables clearly
+plot.new()
+legend("center", legend=c("CPI", "FedFunds", "PPI", "Housing"), 
+       col=c("blue", "red", "green", "purple"), lwd=3, cex=1.0, 
+       ncol=2, bty="n", x.intersp=0.5, y.intersp=0.8)
+
+# Row 3: MAE by iteration (1-step ahead) for all four variables
+mae_1step_cpi <- mae_champion_cpi[,1]  # 1-step ahead MAE for CPI
+mae_1step_fedfunds <- mae_champion_fedfunds[,1]  # 1-step ahead MAE for FedFunds
+mae_1step_ppi <- mae_champion_ppi[,1]  # 1-step ahead MAE for PPI
+mae_1step_housing <- mae_champion_housing[,1]  # 1-step ahead MAE for Housing
+plot(seq_along(mae_1step_cpi), mae_1step_cpi, type="l", col="blue", lwd=2,
+     main="MAE (1-step) vs Iteration", xlab="Iteration", ylab="MAE",
+     ylim=range(c(mae_1step_cpi, mae_1step_fedfunds, mae_1step_ppi, mae_1step_housing)))
+lines(seq_along(mae_1step_fedfunds), mae_1step_fedfunds, col="red", lwd=2)
+lines(seq_along(mae_1step_ppi), mae_1step_ppi, col="green", lwd=2)
+lines(seq_along(mae_1step_housing), mae_1step_housing, col="purple", lwd=2)
+
+# Row 3: RMSE by iteration (1-step ahead) for all four variables
+rmse_1step_cpi <- sqrt(rmse_champion_cpi[,1])  # 1-step ahead RMSE for CPI
+rmse_1step_fedfunds <- sqrt(rmse_champion_fedfunds[,1])  # 1-step ahead RMSE for FedFunds
+rmse_1step_ppi <- sqrt(rmse_champion_ppi[,1])  # 1-step ahead RMSE for PPI
+rmse_1step_housing <- sqrt(rmse_champion_housing[,1])  # 1-step ahead RMSE for Housing
+plot(seq_along(rmse_1step_cpi), rmse_1step_cpi, type="l", col="blue", lwd=2,
+     main="RMSE (1-step) vs Iteration", xlab="Iteration", ylab="RMSE",
+     ylim=range(c(rmse_1step_cpi, rmse_1step_fedfunds, rmse_1step_ppi, rmse_1step_housing)))
+lines(seq_along(rmse_1step_fedfunds), rmse_1step_fedfunds, col="red", lwd=2)
+lines(seq_along(rmse_1step_ppi), rmse_1step_ppi, col="green", lwd=2)
+lines(seq_along(rmse_1step_housing), rmse_1step_housing, col="purple", lwd=2)
+
+# Row 3: Adjusted R² vs iteration for all four variables
+plot(seq_along(adj_r2_champion_cpi), adj_r2_champion_cpi, type="l", col="blue", lwd=2,
+     main="Adjusted R² vs Iteration", xlab="Iteration", ylab="Adjusted R²",
+     ylim=range(c(adj_r2_champion_cpi, adj_r2_champion_fedfunds, adj_r2_champion_ppi, adj_r2_champion_housing)))
+lines(seq_along(adj_r2_champion_fedfunds), adj_r2_champion_fedfunds, col="red", lwd=2)
+lines(seq_along(adj_r2_champion_ppi), adj_r2_champion_ppi, col="green", lwd=2)
+lines(seq_along(adj_r2_champion_housing), adj_r2_champion_housing, col="purple", lwd=2)
+```
+
+```{r step_1_summary}
+# Summary plot for Step 1
+plot.new()
+text(0.5, 0.9, "Champion VAR Model Performance Summary", font=2, cex=1.2)
+
+text(0.05, 0.8, "Cross-Validation Results:", font=2, cex=1, adj=0)
+text(0.05, 0.75, paste("Total Iterations:", length(aic_champion)), cex=0.9, adj=0)
+text(0.05, 0.7, paste("Training Window:", k, "months (20 years)"), cex=0.9, adj=0)
+text(0.05, 0.65, paste("Forecast Horizon:", H, "months"), cex=0.9, adj=0)
+
+text(0.05, 0.55, "MAE Performance Ranges:", font=2, cex=1, adj=0)
+text(0.05, 0.5, paste("CPI MAE: ", round(mean(mean_mae_champion_cpi), 3), " [", round(min(mean_mae_champion_cpi), 3), "-", round(max(mean_mae_champion_cpi), 3), "]"), cex=0.9, adj=0)
+text(0.05, 0.45, paste("FedFunds MAE: ", round(mean(mean_mae_champion_fedfunds), 3), " [", round(min(mean_mae_champion_fedfunds), 3), "-", round(max(mean_mae_champion_fedfunds), 3), "]"), cex=0.9, adj=0)
+text(0.05, 0.4, paste("PPI MAE: ", round(mean(mean_mae_champion_ppi), 3), " [", round(min(mean_mae_champion_ppi), 3), "-", round(max(mean_mae_champion_ppi), 3), "]"), cex=0.9, adj=0)
+text(0.05, 0.35, paste("Housing MAE: ", round(mean(mean_mae_champion_housing), 3), " [", round(min(mean_mae_champion_housing), 3), "-", round(max(mean_mae_champion_housing), 3), "]"), cex=0.9, adj=0)
+
+text(0.55, 0.55, "Model Selection & R² Ranges:", font=2, cex=1, adj=0)
+text(0.55, 0.5, paste("AIC: ", round(mean(aic_champion), 1), " [", round(min(aic_champion), 1), "-", round(max(aic_champion), 1), "]"), cex=0.9, adj=0)
+text(0.55, 0.45, paste("BIC: ", round(mean(bic_champion), 1), " [", round(min(bic_champion), 1), "-", round(max(bic_champion), 1), "]"), cex=0.9, adj=0)
+text(0.55, 0.4, paste("CPI R²: ", round(mean(adj_r2_champion_cpi), 3), " [", round(min(adj_r2_champion_cpi), 3), "-", round(max(adj_r2_champion_cpi), 3), "]"), cex=0.9, adj=0)
+text(0.55, 0.35, paste("FedFunds R²: ", round(mean(adj_r2_champion_fedfunds), 3), " [", round(min(adj_r2_champion_fedfunds), 3), "-", round(max(adj_r2_champion_fedfunds), 3), "]"), cex=0.9, adj=0)
+text(0.55, 0.3, paste("PPI R²: ", round(mean(adj_r2_champion_ppi), 3), " [", round(min(adj_r2_champion_ppi), 3), "-", round(max(adj_r2_champion_ppi), 3), "]"), cex=0.9, adj=0)
+text(0.55, 0.25, paste("Housing R²: ", round(mean(adj_r2_champion_housing), 3), " [", round(min(adj_r2_champion_housing), 3), "-", round(max(adj_r2_champion_housing), 3), "]"), cex=0.9, adj=0)
+
+text(0.05, 0.2, "Notes:", font=2, cex=1, adj=0)
+text(0.05, 0.15, "• Champion VAR(3) model with seasonal components", cex=0.8, adj=0)
+text(0.05, 0.1, "• Includes CPI, FedFunds, PPI, and Housing variables", cex=0.8, adj=0)
+text(0.05, 0.05, "• 20-year rolling window, 1-month step", cex=0.8, adj=0)
+
+```
+
+#### **Step 2 - Non-Intervention Models Over Pre-Intervention Period Only**
+
+```{r cv_step_2}
+# ============================================================================
+# CROSS-VALIDATION PARAMETERS FOR PRE-INTERVENTION PERIOD
+# ============================================================================
+
+# Find the last iteration before intervention period starts
+intervention_start_time <- as.numeric(as.yearmon("2020-12"))
+max_pre_intervention_time <- intervention_start_time - H/12  # Leave buffer for forecast horizon
+
+# Calculate how many iterations we can do before intervention
+# We need to find the last training window that ends before intervention starts
+max_pre_iterations <- 0
+for(test_i in 1:(n-k)) {
+  test_end_time <- st + test_i/p
+  if (test_end_time + H/p <= intervention_start_time) {
+    max_pre_iterations <- test_i
+  } else {
+    break
+  }
+}
+
+cat("Pre-intervention iterations:", max_pre_iterations, "\n")
+cat("Last pre-intervention test period ends:", as.character(as.yearmon(st + max_pre_iterations/p + H/p)), "\n")
+
+# Initialize matrices for storing pre-intervention results  
+mae_pre_cpi <- matrix(NA, max_pre_iterations, H)
+rmse_pre_cpi <- matrix(NA, max_pre_iterations, H)
+mae_pre_fedfunds <- matrix(NA, max_pre_iterations, H)
+rmse_pre_fedfunds <- matrix(NA, max_pre_iterations, H)
+mae_pre_ppi <- matrix(NA, max_pre_iterations, H)
+rmse_pre_ppi <- matrix(NA, max_pre_iterations, H)
+mae_pre_housing <- matrix(NA, max_pre_iterations, H)
+rmse_pre_housing <- matrix(NA, max_pre_iterations, H)
+aic_pre <- numeric(max_pre_iterations)
+bic_pre <- numeric(max_pre_iterations)
+adj_r2_pre_cpi <- numeric(max_pre_iterations)
+adj_r2_pre_fedfunds <- numeric(max_pre_iterations)
+adj_r2_pre_ppi <- numeric(max_pre_iterations)
+adj_r2_pre_housing <- numeric(max_pre_iterations)
+
+# Cross-validation loop for pre-intervention period
+for(i in 1:max_pre_iterations)
+{
+  # Sliding Window - keep the training window of fixed length
+  train <- window(ts_train_champion, start=st+(i-k+1)/p, end=st+i/p) ## Window Length: k
+  
+  test <- window(ts_train_champion, start=st + (i+1)/p, end=st + (i+H)/p) ## Window Length: H
+  
+  # Fit champion VAR model (no intervention)
+  fit_champion <- VAR(train, p = 3, type = "const", season = 12)
+  fcast_champion <- predict(fit_champion, n.ahead = H)
+  
+  # Calculate errors for all four variables
+  # Extract forecasts for all variables
+  fcast_cpi <- as.numeric(fcast_champion[['fcst']][[1]][,1])      # CPI forecasts
+  fcast_fedfunds <- as.numeric(fcast_champion[['fcst']][[2]][,1]) # FedFunds forecasts
+  fcast_ppi <- as.numeric(fcast_champion[['fcst']][[3]][,1])      # PPI forecasts
+  fcast_housing <- as.numeric(fcast_champion[['fcst']][[4]][,1])  # Housing forecasts
+  test_cpi <- as.numeric(test[,1])       # CPI test data
+  test_fedfunds <- as.numeric(test[,2])  # FedFunds test data
+  test_ppi <- as.numeric(test[,3])       # PPI test data
+  test_housing <- as.numeric(test[,4])   # Housing test data
+  
+  # Store forecast errors for all four variables
+  mae_pre_cpi[i,] <- abs(fcast_cpi - test_cpi)
+  rmse_pre_cpi[i,] <- (fcast_cpi - test_cpi)^2
+  mae_pre_fedfunds[i,] <- abs(fcast_fedfunds - test_fedfunds)
+  rmse_pre_fedfunds[i,] <- (fcast_fedfunds - test_fedfunds)^2
+  mae_pre_ppi[i,] <- abs(fcast_ppi - test_ppi)
+  rmse_pre_ppi[i,] <- (fcast_ppi - test_ppi)^2
+  mae_pre_housing[i,] <- abs(fcast_housing - test_housing)
+  rmse_pre_housing[i,] <- (fcast_housing - test_housing)^2
+
+  # Store AIC and BIC values for champion model
+  aic_pre[i] <- AIC(fit_champion)
+  bic_pre[i] <- BIC(fit_champion)
+  
+  # Calculate adjusted R² for each variable equation
+  adj_r2_pre_cpi[i] <- summary(fit_champion)$varresult[[1]]$adj.r.squared
+  adj_r2_pre_fedfunds[i] <- summary(fit_champion)$varresult[[2]]$adj.r.squared
+  adj_r2_pre_ppi[i] <- summary(fit_champion)$varresult[[3]]$adj.r.squared
+  adj_r2_pre_housing[i] <- summary(fit_champion)$varresult[[4]]$adj.r.squared
+}
+
+# Summary of pre-intervention cross-validation results
+cat("Pre-intervention Champion VAR cross-validation completed successfully!\n")
+cat("Training window:", k/12, "years | Forecast horizon:", H, "months | Iterations:", max_pre_iterations, "\n")
+cat("Mean AIC:", round(mean(aic_pre), 2), "| Mean BIC:", round(mean(bic_pre), 2), "\n")
+cat("Mean Adj R² - CPI:", round(mean(adj_r2_pre_cpi), 3), "| FedFunds:", round(mean(adj_r2_pre_fedfunds), 3), "\n")
+cat("Mean Adj R² - PPI:", round(mean(adj_r2_pre_ppi), 3), "| Housing:", round(mean(adj_r2_pre_housing), 3), "\n")
+
+# Calculate mean metrics
+mean_mae_pre_cpi <- colMeans(mae_pre_cpi, na.rm=TRUE)
+mean_rmse_pre_cpi <- sqrt(colMeans(rmse_pre_cpi, na.rm=TRUE))
+mean_mae_pre_fedfunds <- colMeans(mae_pre_fedfunds, na.rm=TRUE)
+mean_rmse_pre_fedfunds <- sqrt(colMeans(rmse_pre_fedfunds, na.rm=TRUE))
+mean_mae_pre_ppi <- colMeans(mae_pre_ppi, na.rm=TRUE)
+mean_rmse_pre_ppi <- sqrt(colMeans(rmse_pre_ppi, na.rm=TRUE))
+mean_mae_pre_housing <- colMeans(mae_pre_housing, na.rm=TRUE)
+mean_rmse_pre_housing <- sqrt(colMeans(rmse_pre_housing, na.rm=TRUE))
+
+# Create plots for pre-intervention period
+par(mfrow=c(3,3))
+
+# Row 1: MAE vs forecast horizon for all four variables
+plot(1:H, mean_mae_pre_cpi, type="l", col="blue", lwd=2, 
+     main="MAE vs Horizon (Pre-Intervention)", xlab="Horizon", ylab="MAE",
+     ylim=range(c(mean_mae_pre_cpi, mean_mae_pre_fedfunds, mean_mae_pre_ppi, mean_mae_pre_housing)))
+lines(1:H, mean_mae_pre_fedfunds, col="red", lwd=2)
+lines(1:H, mean_mae_pre_ppi, col="green", lwd=2)
+lines(1:H, mean_mae_pre_housing, col="purple", lwd=2)
+
+# Row 1: RMSE vs forecast horizon for all four variables
+plot(1:H, mean_rmse_pre_cpi, type="l", col="blue", lwd=2,
+     main="RMSE vs Horizon (Pre-Intervention)", xlab="Horizon", ylab="RMSE",
+     ylim=range(c(mean_rmse_pre_cpi, mean_rmse_pre_fedfunds, mean_rmse_pre_ppi, mean_rmse_pre_housing)))
+lines(1:H, mean_rmse_pre_fedfunds, col="red", lwd=2)
+lines(1:H, mean_rmse_pre_ppi, col="green", lwd=2)
+lines(1:H, mean_rmse_pre_housing, col="purple", lwd=2)
+
+# Row 1: Leave blank (placeholder)
+plot.new()
+
+# Row 2: AIC vs iteration number with upper bound label
+plot(seq_along(aic_pre), aic_pre, type="l", col="green", lwd=2,
+     main="AIC vs Iteration (Pre-Intervention)", xlab="Iteration", ylab="AIC")
+text(length(aic_pre) * 0.8, max(aic_pre, na.rm=TRUE) * 0.95, 
+     paste("Max:", round(max(aic_pre, na.rm=TRUE), 1)), adj=0, cex=0.8)
+
+# Row 2: BIC vs iteration number with upper bound label
+plot(seq_along(bic_pre), bic_pre, type="l", col="orange", lwd=2,
+     main="BIC vs Iteration (Pre-Intervention)", xlab="Iteration", ylab="BIC")
+text(length(bic_pre) * 0.8, max(bic_pre, na.rm=TRUE) * 0.95, 
+     paste("Max:", round(max(bic_pre, na.rm=TRUE), 1)), adj=0, cex=0.8)
+
+# Row 2: Legend for all plots - formatted to show all variables clearly
+plot.new()
+legend("center", legend=c("CPI", "FedFunds", "PPI", "Housing"), 
+       col=c("blue", "red", "green", "purple"), lwd=3, cex=1.0, 
+       ncol=2, bty="n", x.intersp=0.5, y.intersp=0.8)
+
+# Row 3: MAE by iteration (1-step ahead) for all four variables
+mae_1step_pre_cpi <- mae_pre_cpi[,1]  # 1-step ahead MAE for CPI
+mae_1step_pre_fedfunds <- mae_pre_fedfunds[,1]  # 1-step ahead MAE for FedFunds
+mae_1step_pre_ppi <- mae_pre_ppi[,1]  # 1-step ahead MAE for PPI
+mae_1step_pre_housing <- mae_pre_housing[,1]  # 1-step ahead MAE for Housing
+plot(seq_along(mae_1step_pre_cpi), mae_1step_pre_cpi, type="l", col="blue", lwd=2,
+     main="MAE (1-step) vs Iteration (Pre-Intervention)", xlab="Iteration", ylab="MAE",
+     ylim=range(c(mae_1step_pre_cpi, mae_1step_pre_fedfunds, mae_1step_pre_ppi, mae_1step_pre_housing)))
+lines(seq_along(mae_1step_pre_fedfunds), mae_1step_pre_fedfunds, col="red", lwd=2)
+lines(seq_along(mae_1step_pre_ppi), mae_1step_pre_ppi, col="green", lwd=2)
+lines(seq_along(mae_1step_pre_housing), mae_1step_pre_housing, col="purple", lwd=2)
+
+# Row 3: RMSE by iteration (1-step ahead) for all four variables
+rmse_1step_pre_cpi <- sqrt(rmse_pre_cpi[,1])  # 1-step ahead RMSE for CPI
+rmse_1step_pre_fedfunds <- sqrt(rmse_pre_fedfunds[,1])  # 1-step ahead RMSE for FedFunds
+rmse_1step_pre_ppi <- sqrt(rmse_pre_ppi[,1])  # 1-step ahead RMSE for PPI
+rmse_1step_pre_housing <- sqrt(rmse_pre_housing[,1])  # 1-step ahead RMSE for Housing
+plot(seq_along(rmse_1step_pre_cpi), rmse_1step_pre_cpi, type="l", col="blue", lwd=2,
+     main="RMSE (1-step) vs Iteration (Pre-Intervention)", xlab="Iteration", ylab="RMSE",
+     ylim=range(c(rmse_1step_pre_cpi, rmse_1step_pre_fedfunds, rmse_1step_pre_ppi, rmse_1step_pre_housing)))
+lines(seq_along(rmse_1step_pre_fedfunds), rmse_1step_pre_fedfunds, col="red", lwd=2)
+lines(seq_along(rmse_1step_pre_ppi), rmse_1step_pre_ppi, col="green", lwd=2)
+lines(seq_along(rmse_1step_pre_housing), rmse_1step_pre_housing, col="purple", lwd=2)
+
+# Row 3: Adjusted R² vs iteration for all four variables
+plot(seq_along(adj_r2_pre_cpi), adj_r2_pre_cpi, type="l", col="blue", lwd=2,
+     main="Adj R² vs Iteration (Pre-Intervention)", xlab="Iteration", ylab="Adjusted R²",
+     ylim=range(c(adj_r2_pre_cpi, adj_r2_pre_fedfunds, adj_r2_pre_ppi, adj_r2_pre_housing)))
+lines(seq_along(adj_r2_pre_fedfunds), adj_r2_pre_fedfunds, col="red", lwd=2)
+lines(seq_along(adj_r2_pre_ppi), adj_r2_pre_ppi, col="green", lwd=2)
+lines(seq_along(adj_r2_pre_housing), adj_r2_pre_housing, col="purple", lwd=2)
+
+```
+
+```{r step_2_summary}
+# Summary plot for Step 2
+plot.new()
+text(0.5, 0.9, "Pre-Intervention Model Performance Summary", font=2, cex=1.2)
+text(0.05, 0.8, paste("Iterations:", max_pre_iterations), adj=0)
+text(0.05, 0.75, paste("Training Window:", k, "months"), adj=0)
+text(0.05, 0.7, paste("Forecast Horizon:", H, "months"), adj=0)
+text(0.05, 0.55, "MAE Performance Ranges:", font=2, cex=1, adj=0)
+text(0.05, 0.5, paste("CPI MAE: ", round(mean(mean_mae_pre_cpi), 3), " [", round(min(mean_mae_pre_cpi), 3), "-", round(max(mean_mae_pre_cpi), 3), "]"), cex=0.9, adj=0)
+text(0.05, 0.45, paste("FedFunds MAE: ", round(mean(mean_mae_pre_fedfunds), 3), " [", round(min(mean_mae_pre_fedfunds), 3), "-", round(max(mean_mae_pre_fedfunds), 3), "]"), cex=0.9, adj=0)
+text(0.05, 0.4, paste("PPI MAE: ", round(mean(mean_mae_pre_ppi), 3), " [", round(min(mean_mae_pre_ppi), 3), "-", round(max(mean_mae_pre_ppi), 3), "]"), cex=0.9, adj=0)
+text(0.05, 0.35, paste("Housing MAE: ", round(mean(mean_mae_pre_housing), 3), " [", round(min(mean_mae_pre_housing), 3), "-", round(max(mean_mae_pre_housing), 3), "]"), cex=0.9, adj=0)
+text(0.55, 0.55, "Model Selection & R² Ranges:", font=2, cex=1, adj=0)
+text(0.55, 0.5, paste("AIC: ", round(mean(aic_pre), 1), " [", round(min(aic_pre), 1), "-", round(max(aic_pre), 1), "]"), cex=0.9, adj=0)
+text(0.55, 0.45, paste("BIC: ", round(mean(bic_pre), 1), " [", round(min(bic_pre), 1), "-", round(max(bic_pre), 1), "]"), cex=0.9, adj=0)
+text(0.55, 0.4, paste("CPI R²: ", round(mean(adj_r2_pre_cpi), 3), " [", round(min(adj_r2_pre_cpi), 3), "-", round(max(adj_r2_pre_cpi), 3), "]"), cex=0.9, adj=0)
+text(0.55, 0.35, paste("FedFunds R²: ", round(mean(adj_r2_pre_fedfunds), 3), " [", round(min(adj_r2_pre_fedfunds), 3), "-", round(max(adj_r2_pre_fedfunds), 3), "]"), cex=0.9, adj=0)
+text(0.55, 0.3, paste("PPI R²: ", round(mean(adj_r2_pre_ppi), 3), " [", round(min(adj_r2_pre_ppi), 3), "-", round(max(adj_r2_pre_ppi), 3), "]"), cex=0.9, adj=0)
+text(0.55, 0.25, paste("Housing R²: ", round(mean(adj_r2_pre_housing), 3), " [", round(min(adj_r2_pre_housing), 3), "-", round(max(adj_r2_pre_housing), 3), "]"), cex=0.9, adj=0)
+```
+
+#### **Step 3**
+**Cross-validation for step intervention - beginning with first intervention date**
+
+```{r step_3}
+# ============================================================================
+# CROSS-VALIDATION PARAMETERS FOR INTERVENTION PERIOD
+# ============================================================================
+
+# Re-add intervention variable to ts_train_champion for intervention models
+time_indices <- as.numeric(time(ts_train_champion))
+intervention_start_num <- as.numeric(intervention_start)
+intervention_end_num <- as.numeric(intervention_end)
+
+intervention_var <- ifelse(time_indices >= intervention_start_num & 
+                          time_indices <= intervention_end_num, 1, 0)
+
+# Add intervention variable to ts_train_champion
+ts_train_with_intervention <- cbind(ts_train_champion, intervention_var)
+colnames(ts_train_with_intervention) <- c("CPI", "FedFunds", "PPI", "Housing", "intervention")
+
+# Find the first iteration where training window contains intervention data
+min_intervention_iterations <- 0
+for(test_i in 1:(n-k)) {
+  train_start <- st + (test_i - k + 1)/p
+  train_end <- st + test_i/p
+  
+  # Check if this training window contains any intervention data
+  train_window <- window(ts_train_with_intervention, start=train_start, end=train_end)
+  intervention_count <- sum(train_window[, "intervention"])
+  
+  if (intervention_count > 0) {
+    min_intervention_iterations <- test_i
+    cat("First intervention window found at iteration:", test_i, "\n")
+    cat("Training window:", as.character(as.yearmon(train_start)), "to", as.character(as.yearmon(train_end)), "\n")
+    cat("Intervention observations:", intervention_count, "out of", nrow(train_window), "\n")
+    break
+  }
+}
+
+# Calculate maximum iterations (leaving room for test set)
+max_intervention_iterations <- n - k - H + 1
+intervention_iterations <- max_intervention_iterations - min_intervention_iterations + 1
+
+cat("Intervention cross-validation range:", min_intervention_iterations, "to", max_intervention_iterations, "\n")
+cat("Total intervention iterations:", intervention_iterations, "\n")
+
+# Initialize matrices for storing intervention results  
+mae_intervention_cpi <- matrix(NA, intervention_iterations, H)
+rmse_intervention_cpi <- matrix(NA, intervention_iterations, H)
+mae_intervention_fedfunds <- matrix(NA, intervention_iterations, H)
+rmse_intervention_fedfunds <- matrix(NA, intervention_iterations, H)
+mae_intervention_ppi <- matrix(NA, intervention_iterations, H)
+rmse_intervention_ppi <- matrix(NA, intervention_iterations, H)
+mae_intervention_housing <- matrix(NA, intervention_iterations, H)
+rmse_intervention_housing <- matrix(NA, intervention_iterations, H)
+aic_intervention <- numeric(intervention_iterations)
+bic_intervention <- numeric(intervention_iterations)
+adj_r2_intervention_cpi <- numeric(intervention_iterations)
+adj_r2_intervention_fedfunds <- numeric(intervention_iterations)
+adj_r2_intervention_ppi <- numeric(intervention_iterations)
+adj_r2_intervention_housing <- numeric(intervention_iterations)
+
+# Cross-validation loop for intervention period
+for(i in min_intervention_iterations:max_intervention_iterations)
+{
+  # Array index for storing results
+  store_idx <- i - min_intervention_iterations + 1
+  
+  # Sliding Window - keep the training window of fixed length
+  train <- window(ts_train_with_intervention, start=st+(i-k+1)/p, end=st+i/p) ## Window Length: k
+  test <- window(ts_train_with_intervention, start=st + (i+1)/p, end=st + (i+H)/p) ## Window Length: H
+  
+  # Extract intervention variable from training data
+  train_intervention <- train[, "intervention"]
+  
+  # Create intervention variable for forecast period (H periods ahead)
+  forecast_start_time <- time(test)[1]
+  forecast_end_time <- time(test)[length(time(test))]
+  
+  # Create intervention values for the forecast horizon
+  forecast_intervention <- rep(0, H)  # Default to 0 (no intervention)
+  
+  # Check if forecast period overlaps with intervention period
+  if (forecast_start_time <= intervention_end_num && forecast_end_time >= intervention_start_num) {
+    # There's overlap, set intervention to 1 for overlapping periods
+    forecast_intervention <- rep(1, H)
+  }
+  
+  # Fit intervention VAR model with all four variables
+  train_vars <- train[, c("CPI", "FedFunds", "PPI", "Housing")]
+  fit_intervention <- VAR(train_vars, p = 3, type = "const", season = 12, 
+                         exogen = matrix(train_intervention, ncol = 1))
+  fcast_intervention <- predict(fit_intervention, n.ahead = H, 
+                               dumvar = matrix(forecast_intervention, ncol = 1))
+  
+  # Calculate errors for all four variables
+  # Extract forecasts for all variables
+  fcast_cpi <- as.numeric(fcast_intervention[['fcst']][["CPI"]][,"fcst"])      # CPI forecasts
+  fcast_fedfunds <- as.numeric(fcast_intervention[['fcst']][["FedFunds"]][,"fcst"]) # FedFunds forecasts
+  fcast_ppi <- as.numeric(fcast_intervention[['fcst']][["PPI"]][,"fcst"])      # PPI forecasts
+  fcast_housing <- as.numeric(fcast_intervention[['fcst']][["Housing"]][,"fcst"])  # Housing forecasts
+  test_cpi <- as.numeric(test[,"CPI"])       # CPI test data
+  test_fedfunds <- as.numeric(test[,"FedFunds"])  # FedFunds test data
+  test_ppi <- as.numeric(test[,"PPI"])       # PPI test data
+  test_housing <- as.numeric(test[,"Housing"])   # Housing test data
+  
+  # Store forecast errors for all four variables
+  mae_intervention_cpi[store_idx,] <- abs(fcast_cpi - test_cpi)
+  rmse_intervention_cpi[store_idx,] <- (fcast_cpi - test_cpi)^2
+  mae_intervention_fedfunds[store_idx,] <- abs(fcast_fedfunds - test_fedfunds)
+  rmse_intervention_fedfunds[store_idx,] <- (fcast_fedfunds - test_fedfunds)^2
+  mae_intervention_ppi[store_idx,] <- abs(fcast_ppi - test_ppi)
+  rmse_intervention_ppi[store_idx,] <- (fcast_ppi - test_ppi)^2
+  mae_intervention_housing[store_idx,] <- abs(fcast_housing - test_housing)
+  rmse_intervention_housing[store_idx,] <- (fcast_housing - test_housing)^2
+
+  # Store AIC and BIC values for intervention model
+  aic_intervention[store_idx] <- AIC(fit_intervention)
+  bic_intervention[store_idx] <- BIC(fit_intervention)
+  
+  # Calculate adjusted R² for each variable equation
+  adj_r2_intervention_cpi[store_idx] <- summary(fit_intervention)$varresult[["CPI"]]$adj.r.squared
+  adj_r2_intervention_fedfunds[store_idx] <- summary(fit_intervention)$varresult[["FedFunds"]]$adj.r.squared
+  adj_r2_intervention_ppi[store_idx] <- summary(fit_intervention)$varresult[["PPI"]]$adj.r.squared
+  adj_r2_intervention_housing[store_idx] <- summary(fit_intervention)$varresult[["Housing"]]$adj.r.squared
+}
+
+# Summary of intervention cross-validation results
+cat("Intervention VAR cross-validation completed successfully!\n")
+cat("Training window:", k/12, "years | Forecast horizon:", H, "months | Iterations:", intervention_iterations, "\n")
+cat("Mean AIC:", round(mean(aic_intervention), 2), "| Mean BIC:", round(mean(bic_intervention), 2), "\n")
+cat("Mean Adj R² - CPI:", round(mean(adj_r2_intervention_cpi), 3), "| FedFunds:", round(mean(adj_r2_intervention_fedfunds), 3), "\n")
+cat("Mean Adj R² - PPI:", round(mean(adj_r2_intervention_ppi), 3), "| Housing:", round(mean(adj_r2_intervention_housing), 3), "\n")
+
+# Calculate mean metrics
+mean_mae_intervention_cpi <- colMeans(mae_intervention_cpi, na.rm=TRUE)
+mean_rmse_intervention_cpi <- sqrt(colMeans(rmse_intervention_cpi, na.rm=TRUE))
+mean_mae_intervention_fedfunds <- colMeans(mae_intervention_fedfunds, na.rm=TRUE)
+mean_rmse_intervention_fedfunds <- sqrt(colMeans(rmse_intervention_fedfunds, na.rm=TRUE))
+mean_mae_intervention_ppi <- colMeans(mae_intervention_ppi, na.rm=TRUE)
+mean_rmse_intervention_ppi <- sqrt(colMeans(rmse_intervention_ppi, na.rm=TRUE))
+mean_mae_intervention_housing <- colMeans(mae_intervention_housing, na.rm=TRUE)
+mean_rmse_intervention_housing <- sqrt(colMeans(rmse_intervention_housing, na.rm=TRUE))
+
+# Create plots for intervention period
+par(mfrow=c(3,3))
+
+# Row 1: MAE vs forecast horizon for all four variables
+plot(1:H, mean_mae_intervention_cpi, type="l", col="blue", lwd=2, 
+     main="MAE vs Horizon (Intervention)", xlab="Horizon", ylab="MAE",
+     ylim=range(c(mean_mae_intervention_cpi, mean_mae_intervention_fedfunds, mean_mae_intervention_ppi, mean_mae_intervention_housing)))
+lines(1:H, mean_mae_intervention_fedfunds, col="red", lwd=2)
+lines(1:H, mean_mae_intervention_ppi, col="green", lwd=2)
+lines(1:H, mean_mae_intervention_housing, col="purple", lwd=2)
+
+# Row 1: RMSE vs forecast horizon for all four variables
+plot(1:H, mean_rmse_intervention_cpi, type="l", col="blue", lwd=2,
+     main="RMSE vs Horizon (Intervention)", xlab="Horizon", ylab="RMSE",
+     ylim=range(c(mean_rmse_intervention_cpi, mean_rmse_intervention_fedfunds, mean_rmse_intervention_ppi, mean_rmse_intervention_housing)))
+lines(1:H, mean_rmse_intervention_fedfunds, col="red", lwd=2)
+lines(1:H, mean_rmse_intervention_ppi, col="green", lwd=2)
+lines(1:H, mean_rmse_intervention_housing, col="purple", lwd=2)
+
+# Row 1: Leave blank (placeholder)
+plot.new()
+
+# Row 2: AIC vs iteration number with upper bound label
+plot(seq_along(aic_intervention), aic_intervention, type="l", col="green", lwd=2,
+     main="AIC vs Iteration (Intervention)", xlab="Iteration", ylab="AIC")
+text(length(aic_intervention) * 0.8, max(aic_intervention, na.rm=TRUE) * 0.95, 
+     paste("Max:", round(max(aic_intervention, na.rm=TRUE), 1)), adj=0, cex=0.8)
+
+# Row 2: BIC vs iteration number with upper bound label
+plot(seq_along(bic_intervention), bic_intervention, type="l", col="orange", lwd=2,
+     main="BIC vs Iteration (Intervention)", xlab="Iteration", ylab="BIC")
+text(length(bic_intervention) * 0.8, max(bic_intervention, na.rm=TRUE) * 0.95, 
+     paste("Max:", round(max(bic_intervention, na.rm=TRUE), 1)), adj=0, cex=0.8)
+
+# Row 2: Legend for all plots - formatted to show all variables clearly
+plot.new()
+legend("center", legend=c("CPI", "FedFunds", "PPI", "Housing"), 
+       col=c("blue", "red", "green", "purple"), lwd=3, cex=1.0, 
+       ncol=2, bty="n", x.intersp=0.5, y.intersp=0.8)
+
+# Row 3: MAE by iteration (1-step ahead) for all four variables
+mae_1step_intervention_cpi <- mae_intervention_cpi[,1]  # 1-step ahead MAE for CPI
+mae_1step_intervention_fedfunds <- mae_intervention_fedfunds[,1]  # 1-step ahead MAE for FedFunds
+mae_1step_intervention_ppi <- mae_intervention_ppi[,1]  # 1-step ahead MAE for PPI
+mae_1step_intervention_housing <- mae_intervention_housing[,1]  # 1-step ahead MAE for Housing
+plot(seq_along(mae_1step_intervention_cpi), mae_1step_intervention_cpi, type="l", col="blue", lwd=2,
+     main="MAE (1-step) vs Iteration (Intervention)", xlab="Iteration", ylab="MAE",
+     ylim=range(c(mae_1step_intervention_cpi, mae_1step_intervention_fedfunds, mae_1step_intervention_ppi, mae_1step_intervention_housing)))
+lines(seq_along(mae_1step_intervention_fedfunds), mae_1step_intervention_fedfunds, col="red", lwd=2)
+lines(seq_along(mae_1step_intervention_ppi), mae_1step_intervention_ppi, col="green", lwd=2)
+lines(seq_along(mae_1step_intervention_housing), mae_1step_intervention_housing, col="purple", lwd=2)
+
+# Row 3: RMSE by iteration (1-step ahead) for all four variables
+rmse_1step_intervention_cpi <- sqrt(rmse_intervention_cpi[,1])  # 1-step ahead RMSE for CPI
+rmse_1step_intervention_fedfunds <- sqrt(rmse_intervention_fedfunds[,1])  # 1-step ahead RMSE for FedFunds
+rmse_1step_intervention_ppi <- sqrt(rmse_intervention_ppi[,1])  # 1-step ahead RMSE for PPI
+rmse_1step_intervention_housing <- sqrt(rmse_intervention_housing[,1])  # 1-step ahead RMSE for Housing
+plot(seq_along(rmse_1step_intervention_cpi), rmse_1step_intervention_cpi, type="l", col="blue", lwd=2,
+     main="RMSE (1-step) vs Iteration (Intervention)", xlab="Iteration", ylab="RMSE",
+     ylim=range(c(rmse_1step_intervention_cpi, rmse_1step_intervention_fedfunds, rmse_1step_intervention_ppi, rmse_1step_intervention_housing)))
+lines(seq_along(rmse_1step_intervention_fedfunds), rmse_1step_intervention_fedfunds, col="red", lwd=2)
+lines(seq_along(rmse_1step_intervention_ppi), rmse_1step_intervention_ppi, col="green", lwd=2)
+lines(seq_along(rmse_1step_intervention_housing), rmse_1step_intervention_housing, col="purple", lwd=2)
+
+# Row 3: Adjusted R² vs iteration for all four variables
+plot(seq_along(adj_r2_intervention_cpi), adj_r2_intervention_cpi, type="l", col="blue", lwd=2,
+     main="Adj R² vs Iteration (Intervention)", xlab="Iteration", ylab="Adjusted R²",
+     ylim=range(c(adj_r2_intervention_cpi, adj_r2_intervention_fedfunds, adj_r2_intervention_ppi, adj_r2_intervention_housing)))
+lines(seq_along(adj_r2_intervention_fedfunds), adj_r2_intervention_fedfunds, col="red", lwd=2)
+lines(seq_along(adj_r2_intervention_ppi), adj_r2_intervention_ppi, col="green", lwd=2)
+lines(seq_along(adj_r2_intervention_housing), adj_r2_intervention_housing, col="purple", lwd=2)
+
+```
+
+```{r step_3_summary}
+# Summary plot for Step 8
+plot.new()
+text(0.5, 0.9, "Intervention Model Performance Summary", font=2, cex=1.2)
+text(0.05, 0.8, paste("Iterations:", intervention_iterations), adj=0)
+text(0.05, 0.75, paste("Training Window:", k, "months"), adj=0)
+text(0.05, 0.7, paste("Forecast Horizon:", H, "months"), adj=0)
+text(0.05, 0.55, "MAE Performance Ranges:", font=2, cex=1, adj=0)
+text(0.05, 0.5, paste("CPI MAE: ", round(mean(mean_mae_intervention_cpi), 3), " [", round(min(mean_mae_intervention_cpi), 3), "-", round(max(mean_mae_intervention_cpi), 3), "]"), cex=0.9, adj=0)
+text(0.05, 0.45, paste("FedFunds MAE: ", round(mean(mean_mae_intervention_fedfunds), 3), " [", round(min(mean_mae_intervention_fedfunds), 3), "-", round(max(mean_mae_intervention_fedfunds), 3), "]"), cex=0.9, adj=0)
+text(0.05, 0.4, paste("PPI MAE: ", round(mean(mean_mae_intervention_ppi), 3), " [", round(min(mean_mae_intervention_ppi), 3), "-", round(max(mean_mae_intervention_ppi), 3), "]"), cex=0.9, adj=0)
+text(0.05, 0.35, paste("Housing MAE: ", round(mean(mean_mae_intervention_housing), 3), " [", round(min(mean_mae_intervention_housing), 3), "-", round(max(mean_mae_intervention_housing), 3), "]"), cex=0.9, adj=0)
+text(0.55, 0.55, "Model Selection & R² Ranges:", font=2, cex=1, adj=0)
+text(0.55, 0.5, paste("AIC: ", round(mean(aic_intervention), 1), " [", round(min(aic_intervention), 1), "-", round(max(aic_intervention), 1), "]"), cex=0.9, adj=0)
+text(0.55, 0.45, paste("BIC: ", round(mean(bic_intervention), 1), " [", round(min(bic_intervention), 1), "-", round(max(bic_intervention), 1), "]"), cex=0.9, adj=0)
+text(0.55, 0.4, paste("CPI R²: ", round(mean(adj_r2_intervention_cpi), 3), " [", round(min(adj_r2_intervention_cpi), 3), "-", round(max(adj_r2_intervention_cpi), 3), "]"), cex=0.9, adj=0)
+text(0.55, 0.35, paste("FedFunds R²: ", round(mean(adj_r2_intervention_fedfunds), 3), " [", round(min(adj_r2_intervention_fedfunds), 3), "-", round(max(adj_r2_intervention_fedfunds), 3), "]"), cex=0.9, adj=0)
+text(0.55, 0.3, paste("PPI R²: ", round(mean(adj_r2_intervention_ppi), 3), " [", round(min(adj_r2_intervention_ppi), 3), "-", round(max(adj_r2_intervention_ppi), 3), "]"), cex=0.9, adj=0)
+text(0.55, 0.25, paste("Housing R²: ", round(mean(adj_r2_intervention_housing), 3), " [", round(min(adj_r2_intervention_housing), 3), "-", round(max(adj_r2_intervention_housing), 3), "]"), cex=0.9, adj=0)
+```
+
+#### **Step 4**
+**Combine baseline and step intervention cross-validation results for appropriate time periods**
+
+```{r step_4}
+# ============================================================================
+# COMBINE PRE-INTERVENTION AND INTERVENTION RESULTS
+# ============================================================================
+
+# Combine all result matrices for all four variables
+combined_mae_cpi <- rbind(mae_pre_cpi, mae_intervention_cpi)
+combined_rmse_cpi <- rbind(rmse_pre_cpi, rmse_intervention_cpi)
+combined_mae_fedfunds <- rbind(mae_pre_fedfunds, mae_intervention_fedfunds)
+combined_rmse_fedfunds <- rbind(rmse_pre_fedfunds, rmse_intervention_fedfunds)
+combined_mae_ppi <- rbind(mae_pre_ppi, mae_intervention_ppi)
+combined_rmse_ppi <- rbind(rmse_pre_ppi, rmse_intervention_ppi)
+combined_mae_housing <- rbind(mae_pre_housing, mae_intervention_housing)
+combined_rmse_housing <- rbind(rmse_pre_housing, rmse_intervention_housing)
+
+# Combine scalar metrics
+combined_aic <- c(aic_pre, aic_intervention)
+combined_bic <- c(bic_pre, bic_intervention)
+combined_adj_r2_cpi <- c(adj_r2_pre_cpi, adj_r2_intervention_cpi)
+combined_adj_r2_fedfunds <- c(adj_r2_pre_fedfunds, adj_r2_intervention_fedfunds)
+combined_adj_r2_ppi <- c(adj_r2_pre_ppi, adj_r2_intervention_ppi)
+combined_adj_r2_housing <- c(adj_r2_pre_housing, adj_r2_intervention_housing)
+
+# Calculate combined mean metrics for all four variables
+combined_mean_mae_cpi <- colMeans(combined_mae_cpi, na.rm=TRUE)
+combined_mean_rmse_cpi <- sqrt(colMeans(combined_rmse_cpi, na.rm=TRUE))
+combined_mean_mae_fedfunds <- colMeans(combined_mae_fedfunds, na.rm=TRUE)
+combined_mean_rmse_fedfunds <- sqrt(colMeans(combined_rmse_fedfunds, na.rm=TRUE))
+combined_mean_mae_ppi <- colMeans(combined_mae_ppi, na.rm=TRUE)
+combined_mean_rmse_ppi <- sqrt(colMeans(combined_rmse_ppi, na.rm=TRUE))
+combined_mean_mae_housing <- colMeans(combined_mae_housing, na.rm=TRUE)
+combined_mean_rmse_housing <- sqrt(colMeans(combined_rmse_housing, na.rm=TRUE))
+
+# Total iterations and transition point
+total_iterations <- max_pre_iterations + intervention_iterations
+transition_point <- max_pre_iterations + 0.5  # Midpoint for vertical line
+
+cat("Combined cross-validation summary:\n")
+cat("Pre-intervention iterations:", max_pre_iterations, "\n")
+cat("Intervention iterations:", intervention_iterations, "\n")
+cat("Total combined iterations:", total_iterations, "\n")
+cat("Transition point at iteration:", transition_point, "\n")
+
+# Summary statistics
+cat("\nCombined performance metrics:\n")
+cat("Mean AIC (Pre-intervention):", round(mean(aic_pre), 2), "| (Intervention):", round(mean(aic_intervention), 2), "\n")
+cat("Mean BIC (Pre-intervention):", round(mean(bic_pre), 2), "| (Intervention):", round(mean(bic_intervention), 2), "\n")
+cat("Mean Adj R² CPI (Pre):", round(mean(adj_r2_pre_cpi), 3), "| (Intervention):", round(mean(adj_r2_intervention_cpi), 3), "\n")
+cat("Mean Adj R² FedFunds (Pre):", round(mean(adj_r2_pre_fedfunds), 3), "| (Intervention):", round(mean(adj_r2_intervention_fedfunds), 3), "\n")
+cat("Mean Adj R² PPI (Pre):", round(mean(adj_r2_pre_ppi), 3), "| (Intervention):", round(mean(adj_r2_intervention_ppi), 3), "\n")
+cat("Mean Adj R² Housing (Pre):", round(mean(adj_r2_pre_housing), 3), "| (Intervention):", round(mean(adj_r2_intervention_housing), 3), "\n")
+
+# Create combined plots
+par(mfrow=c(3,3))
+
+# Row 1: Combined MAE vs forecast horizon for all four variables
+plot(1:H, combined_mean_mae_cpi, type="l", col="blue", lwd=2, 
+     main="MAE vs Forecast Horizon", xlab="Horizon", ylab="MAE",
+     ylim=range(c(combined_mean_mae_cpi, combined_mean_mae_fedfunds, combined_mean_mae_ppi, combined_mean_mae_housing)))
+lines(1:H, combined_mean_mae_fedfunds, col="red", lwd=2)
+lines(1:H, combined_mean_mae_ppi, col="green", lwd=2)
+lines(1:H, combined_mean_mae_housing, col="purple", lwd=2)
+
+# Row 1: Combined RMSE vs forecast horizon for all four variables
+plot(1:H, combined_mean_rmse_cpi, type="l", col="blue", lwd=2,
+     main="RMSE vs Forecast Horizon", xlab="Horizon", ylab="RMSE",
+     ylim=range(c(combined_mean_rmse_cpi, combined_mean_rmse_fedfunds, combined_mean_rmse_ppi, combined_mean_rmse_housing)))
+lines(1:H, combined_mean_rmse_fedfunds, col="red", lwd=2)
+lines(1:H, combined_mean_rmse_ppi, col="green", lwd=2)
+lines(1:H, combined_mean_rmse_housing, col="purple", lwd=2)
+
+# Row 1: Leave blank (placeholder)
+plot.new()
+
+# Row 2: Combined AIC vs iteration number with transition line and upper bound label
+plot(seq_along(combined_aic), combined_aic, type="l", col="green", lwd=2,
+     main="AIC vs Iteration", xlab="Iteration", ylab="AIC")
+abline(v=transition_point, col="black", lty=2, lwd=2)
+text(transition_point + 5, max(combined_aic, na.rm=TRUE) * 0.95, "Baseline → Intervention", adj=0, cex=0.8)
+text(length(combined_aic) * 0.8, max(combined_aic, na.rm=TRUE) * 0.85, 
+     paste("Max:", round(max(combined_aic, na.rm=TRUE), 1)), adj=0, cex=0.8)
+
+# Row 2: Combined BIC vs iteration number with transition line and upper bound label
+plot(seq_along(combined_bic), combined_bic, type="l", col="orange", lwd=2,
+     main="BIC vs Iteration", xlab="Iteration", ylab="BIC")
+abline(v=transition_point, col="black", lty=2, lwd=2)
+text(transition_point + 5, max(combined_bic, na.rm=TRUE) * 0.95, "Baseline → Intervention", adj=0, cex=0.8)
+text(length(combined_bic) * 0.8, max(combined_bic, na.rm=TRUE) * 0.85, 
+     paste("Max:", round(max(combined_bic, na.rm=TRUE), 1)), adj=0, cex=0.8)
+
+# Row 2: Legend for all plots - formatted to show all variables clearly
+plot.new()
+legend("center", legend=c("CPI", "FedFunds", "PPI", "Housing"), 
+       col=c("blue", "red", "green", "purple"), lwd=3, cex=1.0, 
+       ncol=2, bty="n", x.intersp=0.5, y.intersp=0.8)
+
+# Row 3: Combined MAE by iteration (1-step ahead) for all four variables with transition line
+combined_mae_1step_cpi <- c(mae_pre_cpi[,1], mae_intervention_cpi[,1])
+combined_mae_1step_fedfunds <- c(mae_pre_fedfunds[,1], mae_intervention_fedfunds[,1])
+combined_mae_1step_ppi <- c(mae_pre_ppi[,1], mae_intervention_ppi[,1])
+combined_mae_1step_housing <- c(mae_pre_housing[,1], mae_intervention_housing[,1])
+plot(seq_along(combined_mae_1step_cpi), combined_mae_1step_cpi, type="l", col="blue", lwd=2,
+     main="MAE (1-step) vs Iteration", xlab="Iteration", ylab="MAE",
+     ylim=range(c(combined_mae_1step_cpi, combined_mae_1step_fedfunds, combined_mae_1step_ppi, combined_mae_1step_housing)))
+lines(seq_along(combined_mae_1step_fedfunds), combined_mae_1step_fedfunds, col="red", lwd=2)
+lines(seq_along(combined_mae_1step_ppi), combined_mae_1step_ppi, col="green", lwd=2)
+lines(seq_along(combined_mae_1step_housing), combined_mae_1step_housing, col="purple", lwd=2)
+abline(v=transition_point, col="black", lty=2, lwd=2)
+text(transition_point + 5, max(combined_mae_1step_cpi, na.rm=TRUE) * 0.95, "Baseline → Intervention", adj=0, cex=0.8)
+
+# Row 3: Combined RMSE by iteration (1-step ahead) for all four variables with transition line
+combined_rmse_1step_cpi <- c(sqrt(rmse_pre_cpi[,1]), sqrt(rmse_intervention_cpi[,1]))
+combined_rmse_1step_fedfunds <- c(sqrt(rmse_pre_fedfunds[,1]), sqrt(rmse_intervention_fedfunds[,1]))
+combined_rmse_1step_ppi <- c(sqrt(rmse_pre_ppi[,1]), sqrt(rmse_intervention_ppi[,1]))
+combined_rmse_1step_housing <- c(sqrt(rmse_pre_housing[,1]), sqrt(rmse_intervention_housing[,1]))
+plot(seq_along(combined_rmse_1step_cpi), combined_rmse_1step_cpi, type="l", col="blue", lwd=2,
+     main="RMSE (1-step) vs Iteration", xlab="Iteration", ylab="RMSE",
+     ylim=range(c(combined_rmse_1step_cpi, combined_rmse_1step_fedfunds, combined_rmse_1step_ppi, combined_rmse_1step_housing)))
+lines(seq_along(combined_rmse_1step_fedfunds), combined_rmse_1step_fedfunds, col="red", lwd=2)
+lines(seq_along(combined_rmse_1step_ppi), combined_rmse_1step_ppi, col="green", lwd=2)
+lines(seq_along(combined_rmse_1step_housing), combined_rmse_1step_housing, col="purple", lwd=2)
+abline(v=transition_point, col="black", lty=2, lwd=2)
+text(transition_point + 5, max(combined_rmse_1step_cpi, na.rm=TRUE) * 0.95, "Baseline → Intervention", adj=0, cex=0.8)
+
+# Row 3: Combined Adjusted R² vs iteration for all four variables with transition line
+plot(seq_along(combined_adj_r2_cpi), combined_adj_r2_cpi, type="l", col="blue", lwd=2,
+     main="Adjusted R² vs Iteration", xlab="Iteration", ylab="Adjusted R²",
+     ylim=range(c(combined_adj_r2_cpi, combined_adj_r2_fedfunds, combined_adj_r2_ppi, combined_adj_r2_housing)))
+lines(seq_along(combined_adj_r2_fedfunds), combined_adj_r2_fedfunds, col="red", lwd=2)
+lines(seq_along(combined_adj_r2_ppi), combined_adj_r2_ppi, col="green", lwd=2)
+lines(seq_along(combined_adj_r2_housing), combined_adj_r2_housing, col="purple", lwd=2)
+abline(v=transition_point, col="black", lty=2, lwd=2)
+text(transition_point + 5, max(combined_adj_r2_cpi, na.rm=TRUE) * 0.95, "Baseline → Intervention", adj=0, cex=0.8)
+```
+
+```{r step_4_summary, fig.height=8}
+# Model comparison summary plot with increased height
+par(pin=c(7, 8))  # Set plot dimensions: width=7, height=8 inches
+plot.new()
+text(0.5, 0.9, "Combined Model Performance Summary", font=2, cex=1.2)
+
+# Pre-intervention summary
+text(0.25, 0.8, "Pre-Intervention (Baseline)", font=2, cex=1, col="blue")
+text(0.05, 0.75, paste("Iterations:", max_pre_iterations), adj=0, cex=0.9)
+text(0.05, 0.7, paste("AIC:", round(mean(aic_pre), 1), "[", round(min(aic_pre), 1), "-", round(max(aic_pre), 1), "]"), adj=0, cex=0.8)
+text(0.05, 0.65, paste("BIC:", round(mean(bic_pre), 1), "[", round(min(bic_pre), 1), "-", round(max(bic_pre), 1), "]"), adj=0, cex=0.8)
+text(0.05, 0.6, paste("R² CPI:", round(mean(adj_r2_pre_cpi), 3), "[", round(min(adj_r2_pre_cpi), 3), "-", round(max(adj_r2_pre_cpi), 3), "]"), adj=0, cex=0.8)
+text(0.05, 0.55, paste("R² FF:", round(mean(adj_r2_pre_fedfunds), 3), "[", round(min(adj_r2_pre_fedfunds), 3), "-", round(max(adj_r2_pre_fedfunds), 3), "]"), adj=0, cex=0.8)
+text(0.05, 0.5, paste("R² PPI:", round(mean(adj_r2_pre_ppi), 3), "[", round(min(adj_r2_pre_ppi), 3), "-", round(max(adj_r2_pre_ppi), 3), "]"), adj=0, cex=0.8)
+text(0.05, 0.45, paste("R² Hsg:", round(mean(adj_r2_pre_housing), 3), "[", round(min(adj_r2_pre_housing), 3), "-", round(max(adj_r2_pre_housing), 3), "]"), adj=0, cex=0.8)
+
+# Intervention summary
+text(0.75, 0.8, "Intervention Period", font=2, cex=1, col="red")
+text(0.55, 0.75, paste("Iterations:", intervention_iterations), adj=0, cex=0.9)
+text(0.55, 0.7, paste("AIC:", round(mean(aic_intervention), 1), "[", round(min(aic_intervention), 1), "-", round(max(aic_intervention), 1), "]"), adj=0, cex=0.8)
+text(0.55, 0.65, paste("BIC:", round(mean(bic_intervention), 1), "[", round(min(bic_intervention), 1), "-", round(max(bic_intervention), 1), "]"), adj=0, cex=0.8)
+text(0.55, 0.6, paste("R² CPI:", round(mean(adj_r2_intervention_cpi), 3), "[", round(min(adj_r2_intervention_cpi), 3), "-", round(max(adj_r2_intervention_cpi), 3), "]"), adj=0, cex=0.8)
+text(0.55, 0.55, paste("R² FF:", round(mean(adj_r2_intervention_fedfunds), 3), "[", round(min(adj_r2_intervention_fedfunds), 3), "-", round(max(adj_r2_intervention_fedfunds), 3), "]"), adj=0, cex=0.8)
+text(0.55, 0.5, paste("R² PPI:", round(mean(adj_r2_intervention_ppi), 3), "[", round(min(adj_r2_intervention_ppi), 3), "-", round(max(adj_r2_intervention_ppi), 3), "]"), adj=0, cex=0.8)
+text(0.55, 0.45, paste("R² Hsg:", round(mean(adj_r2_intervention_housing), 3), "[", round(min(adj_r2_intervention_housing), 3), "-", round(max(adj_r2_intervention_housing), 3), "]"), adj=0, cex=0.8)
+
+# Overall combined averages and ranges
+text(0.5, 0.35, "Overall Performance", font=2, cex=1.1, col="darkgreen")
+text(0.05, 0.31, paste("Mean AIC:", round(mean(combined_aic), 1), "[", round(min(combined_aic), 1), "-", round(max(combined_aic), 1), "]"), adj=0, cex=0.9)
+text(0.05, 0.28, paste("Mean BIC:", round(mean(combined_bic), 1), "[", round(min(combined_bic), 1), "-", round(max(combined_bic), 1), "]"), adj=0, cex=0.9)
+text(0.05, 0.25, paste("Mean MAE CPI:", round(mean(combined_mean_mae_cpi), 3), "[", round(min(combined_mean_mae_cpi), 3), "-", round(max(combined_mean_mae_cpi), 3), "]"), adj=0, cex=0.9)
+text(0.05, 0.22, paste("Mean RMSE CPI:", round(mean(combined_mean_rmse_cpi), 3), "[", round(min(combined_mean_rmse_cpi), 3), "-", round(max(combined_mean_rmse_cpi), 3), "]"), adj=0, cex=0.9)
+text(0.05, 0.19, paste("Mean R² CPI:", round(mean(combined_adj_r2_cpi), 3), "[", round(min(combined_adj_r2_cpi), 3), "-", round(max(combined_adj_r2_cpi), 3), "]"), adj=0, cex=0.9)
+text(0.05, 0.16, paste("Mean R² FF:", round(mean(combined_adj_r2_fedfunds), 3), "[", round(min(combined_adj_r2_fedfunds), 3), "-", round(max(combined_adj_r2_fedfunds), 3), "]"), adj=0, cex=0.9)
+text(0.05, 0.13, paste("Mean R² PPI:", round(mean(combined_adj_r2_ppi), 3), "[", round(min(combined_adj_r2_ppi), 3), "-", round(max(combined_adj_r2_ppi), 3), "]"), adj=0, cex=0.9)
+text(0.05, 0.10, paste("Mean R² Hsg:", round(mean(combined_adj_r2_housing), 3), "[", round(min(combined_adj_r2_housing), 3), "-", round(max(combined_adj_r2_housing), 3), "]"), adj=0, cex=0.9)
+
+text(0.5, 0.07, paste("Total Periods Analyzed:", total_iterations, "| Transition at:", round(transition_point)), adj=0.5, cex=0.9)
+```
