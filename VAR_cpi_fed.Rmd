@@ -1,0 +1,1396 @@
+---
+title: "Time Series Analysis - Final Project - VAR Model"
+author: "Steve Veldman"
+date: "August 7, 2025"
+output: 
+  html_document:
+    toc: false
+    theme: cosmo
+    highlight: tango
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+library(tidyverse)
+library(forecast)
+library(tseries)
+library(lubridate)
+library(TSA)
+library(readxl)
+library(stringr)
+library(zoo)
+library(moments)
+library(vars)
+```
+
+### **Background**
+**This analysis will focus on using the combined_time_series.csv to create a VAR model with CPI and Federal Funds Rate to forecast the CPI.**  
+  
+#### **Step 1**
+**Load the data from Final Project\combined_time_series.csv**  
+**a. Plot the CPI and Federal Funds Rate time series.**  
+**b. Plot the CPI time series against the FedFunds time series and calculate the correlation between CPI and FedFunds.**  
+
+**Evaluate the results and determine if a log transformation is needed for any of the variables.**
+
+```{r step_1}
+# Load the data
+data <- read.csv("combined_time_series.csv")
+
+# Convert Date column to proper date format
+data$Date <- as.Date(data$Date)
+
+# a. Plot time series for CPI and Federal Funds Rate
+par(mfrow = c(1, 1))
+plot(data$Date, data$CPI, type = "l", col = "blue", 
+     main = "CPI Time Series", xlab = "Date", ylab = "CPI")
+par(mfrow = c(1, 1))
+plot(data$Date, data$FedFunds, type = "l", col = "red", 
+     main = "Federal Funds Rate Time Series", xlab = "Date", ylab = "Fed Funds Rate (%)")
+
+# b. Plot CPI against FedFunds and calculate correlation
+par(mfrow = c(1, 1))
+plot(data$FedFunds, data$CPI, pch = 16, col = "darkblue",
+     main = "CPI vs Federal Funds Rate", xlab = "Federal Funds Rate (%)", ylab = "CPI")
+
+correlation_cpi_fedfunds <- cor(data$CPI, data$FedFunds, use = "complete.obs")
+cat("Correlation between CPI and Federal Funds Rate:", round(correlation_cpi_fedfunds, 4), "\n")
+```
+
+```{r adf_test_helper_function}
+# Function to perform ADF test and display results
+adf_test_results <- function(series, series_name) {
+  test_result <- adf.test(series)
+  return(data.frame(
+    Variable = series_name,
+    ADF_Statistic = round(test_result$statistic, 4),
+    P_Value = round(test_result$p.value, 4),
+    Stationary = ifelse(test_result$p.value < 0.05, "Yes", "No")
+  ))
+}
+```
+
+#### **Step 2**
+**Address the stationarity of the CPI.**
+```{r step_2_CPI_Stationarity}
+# ============================================================================
+# CPI STATIONARITY ANALYSIS
+# ============================================================================
+
+# Log transform CPI to handle exponential growth and stabilize variance
+log_CPI <- log(data$CPI)
+
+# Plot transformed CPI
+par(mfrow = c(1, 1))
+plot(data$Date, log_CPI, type = "l", col = "blue", 
+     main = "Log(CPI) Time Series", xlab = "Date", ylab = "Log(CPI)")
+
+# Test stationarity of Log(CPI)
+result_log_cpi <- adf_test_results(log_CPI, "Log(CPI)")
+print(result_log_cpi)
+
+# Plot ACF and PACF of Log(CPI)
+par(mfrow = c(1, 2))
+acf(log_CPI, main = "ACF: Log(CPI)")
+pacf(log_CPI, main = "PACF: Log(CPI)")
+
+
+# First difference Log(CPI)
+diff_log_cpi <- diff(log_CPI)
+
+# Visual inspection of the inflation rate series
+par(mfrow = c(1, 1))
+plot(data$Date[-1], diff_log_cpi, type = "l", col = "blue", lwd = 2,
+     main = "Inflation Rate: Δ(Log(CPI))", 
+     xlab = "Date", ylab = "Monthly Inflation Rate")
+abline(h = 0, col = "gray", lty = 2)
+abline(h = mean(diff_log_cpi, na.rm = TRUE), col = "red", lty = 2)
+legend("topright", legend = c("Inflation Rate", "Zero Line", "Mean"), 
+          col = c("blue", "gray", "red"), lty = c(1, 2, 2), lwd = c(2, 1, 1))
+
+# Test stationarity of Δ(Log(CPI))
+result_diff_log_cpi <- adf_test_results(diff_log_cpi, "Δ(Log(CPI)) [Inflation Rate]")
+print(result_diff_log_cpi)
+
+# Plot ACF and PACF of Δ(Log(CPI))
+par(mfrow = c(1, 2))
+acf(diff_log_cpi, main = "ACF: Δ(Log(CPI))")
+pacf(diff_log_cpi, main = "PACF: Δ(Log(CPI))")
+
+# CPI Seasonality Analysis
+
+# Extended ACF to check for seasonal patterns
+par(mfrow = c(1, 1))
+acf(diff_log_cpi, lag.max = 48, main = "Extended ACF: Δ(Log(CPI)) - Check for Seasonality")
+
+# Seasonal decomposition to measure seasonal strength
+ts_diff_log_cpi <- ts(diff_log_cpi, start = c(1990, 2), frequency = 12)
+decomposed_cpi <- decompose(ts_diff_log_cpi, type = "additive")
+
+par(mfrow = c(4, 1))
+plot(decomposed_cpi)
+title("Seasonal Decomposition of Δ(Log(CPI))", outer = TRUE, line = -1)
+
+# Calculate seasonal strength measure
+seasonal_variance <- var(decomposed_cpi$seasonal, na.rm = TRUE)
+random_variance <- var(decomposed_cpi$random, na.rm = TRUE)
+seasonal_strength <- seasonal_variance / (seasonal_variance + random_variance)
+
+# Box-Pierce tests at seasonal lags
+bp_12 <- Box.test(diff_log_cpi, lag = 12, type = "Box-Pierce")
+bp_24 <- Box.test(diff_log_cpi, lag = 24, type = "Box-Pierce")
+bp_36 <- Box.test(diff_log_cpi, lag = 36, type = "Box-Pierce")
+
+cat("      Box-Pierce test at lag 12 (p-value):", round(bp_12$p.value, 4), "\n")
+cat("      Box-Pierce test at lag 24 (p-value):", round(bp_24$p.value, 4), "\n")
+cat("      Box-Pierce test at lag 36 (p-value):", round(bp_36$p.value, 4), "\n")
+
+# Seasonal differencing test
+cat("\n   e) Testing Seasonal Differencing:\n")
+seasonal_diff_log_cpi <- diff(diff_log_cpi, lag = 12)
+adf_seasonal <- adf.test(seasonal_diff_log_cpi)
+
+cat("      ADF test on seasonally differenced Δ(Log(CPI)):\n")
+cat("        ADF Statistic:", round(adf_seasonal$statistic, 4), "\n")
+cat("        P-value:", round(adf_seasonal$p.value, 4), "\n")
+cat("        Stationary:", ifelse(adf_seasonal$p.value < 0.05, "Yes", "No"), "\n")
+
+# Seasonality assessment and recommendation
+cat("\n   f) Seasonality Assessment:\n")
+if(seasonal_strength > 0.6) {
+     cat("      STRONG SEASONALITY: Seasonal differencing recommended\n")
+     cat("        - Seasonal strength ratio:", round(seasonal_strength, 4), "> 0.6\n")
+     cat("        - Consider using Δ_12(Δ_1(Log(CPI))) for VAR\n")
+} else if(seasonal_strength > 0.3) {
+     cat("      MODERATE SEASONALITY: Consider seasonal differencing\n")
+     cat("        - Seasonal strength ratio:", round(seasonal_strength, 4), "> 0.3\n")
+     cat("        - May benefit from seasonal VAR or seasonal differencing\n")
+} else {
+     cat("      WEAK SEASONALITY: First differencing sufficient\n")
+     cat("        - Seasonal strength ratio:", round(seasonal_strength, 4), "≤ 0.3\n")
+     cat("        - Current approach (Δ(Log(CPI))) is appropriate\n")
+}
+
+# Final CPI recommendation
+cat("\n   g) Final CPI Recommendation:\n")
+significant_seasonal_lags <- c()
+if(bp_12$p.value < 0.05) significant_seasonal_lags <- c(significant_seasonal_lags, 12)
+if(bp_24$p.value < 0.05) significant_seasonal_lags <- c(significant_seasonal_lags, 24)
+if(bp_36$p.value < 0.05) significant_seasonal_lags <- c(significant_seasonal_lags, 36)
+
+if(length(significant_seasonal_lags) > 0) {
+     cat("      ✓ SEASONAL DIFFERENCING RECOMMENDED for CPI\n")
+     cat("        - Significant autocorrelation at lags:", paste(significant_seasonal_lags, collapse = ", "), "\n")
+     cat("        - Seasonal strength ratio:", round(seasonal_strength, 4), "\n")
+     cat("        - Use Δ_12(Δ_1(Log(CPI))) for VAR modeling\n")
+} else {
+     cat("      ✓ FIRST DIFFERENCING SUFFICIENT for CPI\n")
+     cat("        - No significant seasonal autocorrelation detected\n")
+     cat("        - Seasonal strength ratio:", round(seasonal_strength, 4), "\n")
+     cat("        - Current approach (Δ(Log(CPI))) is appropriate\n")
+}
+
+# Plot ACF and PACF of Δ_12(Δ(Log(CPI)))
+par(mfrow = c(1, 2))
+acf(seasonal_diff_log_cpi, main = "ACF: Δ_12(Δ(Log(CPI)))")
+pacf(seasonal_diff_log_cpi, main = "PACF: Δ_12(Δ(Log(CPI)))")
+
+
+# Store CPI results for later use - Note: Due to results of the seasonality analysis for Fed Funds (below), we will use the first differencing for CPI and address seasonality in the VAR model.
+cpi_final_series <- diff_log_cpi
+cpi_final_name <- "Δ(Log(CPI)) [Inflation Rate]"
+```
+
+#### **Step 3**
+**Address the stationarity of the Federal Funds Rate.**
+
+```{r step_3}
+# ============================================================================
+# Address the stationarity of the Federal Funds Rate
+# ============================================================================
+
+# First difference Fed Funds to handle random walk behavior
+diff_FedFunds <- diff(data$FedFunds)
+
+# Plot transformed series
+par(mfrow = c(1, 1))
+plot(data$Date[-1], diff_FedFunds, type = "l", col = "red", 
+     main = "First Difference of Federal Funds Rate", xlab = "Date", ylab = "Δ Fed Funds Rate (%)")
+
+# Test stationarity of Δ(Fed Funds)
+cat("3. Testing stationarity of Δ(Fed Funds):\n")
+result_diff_fedfunds <- adf_test_results(diff_FedFunds, "Δ(Fed Funds) [Policy Change]")
+print(result_diff_fedfunds)
+
+# ============================================================================
+# FED FUNDS SEASONALITY ANALYSIS
+# ============================================================================
+cat("\n   a) Fed Funds Seasonality Analysis:\n")
+
+# Plot ACF and PACF of Δ(Fed Funds)
+par(mfrow = c(1, 2))
+acf(diff_FedFunds, main = "ACF: Δ(Fed Funds)")
+pacf(diff_FedFunds, main = "PACF: Δ(Fed Funds)")
+
+# Extended ACF to check for seasonal patterns
+par(mfrow = c(1, 1))
+acf(diff_FedFunds, lag.max = 48, main = "Extended ACF: Δ(Fed Funds) - Check for Seasonality")
+
+# Seasonal decomposition to measure seasonal strength
+ts_diff_FedFunds <- ts(diff_FedFunds, start = c(1990, 2), frequency = 12)
+decomposed_fedfunds <- decompose(ts_diff_FedFunds, type = "additive")
+
+par(mfrow = c(4, 1))
+plot(decomposed_fedfunds)
+title("Seasonal Decomposition of Δ(Fed Funds)", outer = TRUE, line = -1)
+
+# Calculate seasonal strength measure for Fed Funds
+seasonal_variance_fedfunds <- var(decomposed_fedfunds$seasonal, na.rm = TRUE)
+random_variance_fedfunds <- var(decomposed_fedfunds$random, na.rm = TRUE)
+seasonal_strength_fedfunds <- seasonal_variance_fedfunds / (seasonal_variance_fedfunds + random_variance_fedfunds)
+
+cat("      Fed Funds seasonal strength ratio:", round(seasonal_strength_fedfunds, 4), "\n")
+
+# Box-Pierce tests at seasonal lags for Fed Funds
+bp_fedfunds_12 <- Box.test(diff_FedFunds, lag = 12, type = "Box-Pierce")
+bp_fedfunds_24 <- Box.test(diff_FedFunds, lag = 24, type = "Box-Pierce")
+bp_fedfunds_36 <- Box.test(diff_FedFunds, lag = 36, type = "Box-Pierce")
+
+cat("      Fed Funds Box-Pierce test at lag 12 (p-value):", round(bp_fedfunds_12$p.value, 4), "\n")
+cat("      Fed Funds Box-Pierce test at lag 24 (p-value):", round(bp_fedfunds_24$p.value, 4), "\n")
+cat("      Fed Funds Box-Pierce test at lag 36 (p-value):", round(bp_fedfunds_36$p.value, 4), "\n")
+
+# Test seasonal differencing for Fed Funds
+cat("\n   b) Testing Seasonal Differencing for Fed Funds:\n")
+seasonal_diff_FedFunds <- diff(diff_FedFunds, lag = 12)
+adf_seasonal_fedfunds <- adf.test(seasonal_diff_FedFunds)
+
+cat("      ADF test on seasonally differenced Δ(Fed Funds):\n")
+cat("        ADF Statistic:", round(adf_seasonal_fedfunds$statistic, 4), "\n")
+cat("        P-value:", round(adf_seasonal_fedfunds$p.value, 4), "\n")
+cat("        Stationary:", ifelse(adf_seasonal_fedfunds$p.value < 0.05, "Yes", "No"), "\n")
+
+# Seasonality assessment and recommendation for Fed Funds
+cat("\n   c) Fed Funds Seasonality Assessment:\n")
+if(seasonal_strength_fedfunds > 0.6) {
+     cat("      STRONG SEASONALITY: Seasonal differencing recommended\n")
+     cat("        - Seasonal strength ratio:", round(seasonal_strength_fedfunds, 4), "> 0.6\n")
+     cat("        - Consider using Δ_12(Δ(Fed Funds)) for VAR\n")
+} else if(seasonal_strength_fedfunds > 0.3) {
+     cat("      MODERATE SEASONALITY: Consider seasonal differencing\n")
+     cat("        - Seasonal strength ratio:", round(seasonal_strength_fedfunds, 4), "> 0.3\n")
+     cat("        - May benefit from seasonal VAR or seasonal differencing\n")
+} else {
+     cat("      WEAK SEASONALITY: First differencing sufficient\n")
+     cat("        - Seasonal strength ratio:", round(seasonal_strength_fedfunds, 4), "≤ 0.3\n")
+     cat("        - Current approach (Δ(Fed Funds)) is appropriate\n")
+}
+
+fedfunds_final_series <- diff_FedFunds
+fedfunds_final_name <- "Δ(Fed Funds) [Policy Change]"
+
+# ============================================================================
+# COMBINED ANALYSIS AND FINAL PREPARATION
+# ============================================================================
+
+# Create a data frame with the final stationary series
+final_data <- data.frame(
+  Date = data$Date[-1],
+  CPI = cpi_final_series,
+  FedFunds = fedfunds_final_series
+)
+
+# Cross-correlation between the two stationary series
+par(mfrow = c(1, 1))
+ccf(final_data$CPI, final_data$FedFunds, 
+     main = paste("Cross-Correlation:", cpi_final_name, "vs", fedfunds_final_name),
+     xlab = "Lag", ylab = "Cross-Correlation")
+
+# Plot the final transformed variables against each other
+par(mfrow = c(1, 1))
+plot(final_data$FedFunds, final_data$CPI, pch = 16, col = "darkblue",
+     main = "CPI vs Federal Funds Rate", xlab = "Transformed Federal Funds Rate (%)", ylab = "Transformed CPI")
+
+# Calculate correlation between transformed variables
+correlation_transformed <- cor(final_data$CPI, final_data$FedFunds, use = "complete.obs")
+print(round(correlation_transformed, 4))
+
+# Compare with original correlation
+print(round(correlation_cpi_fedfunds, 4))
+```
+
+
+KEY INSIGHTS FROM CROSS-CORRELATION ANALYSIS
+
+1. CONTEMPORANEOUS RELATIONSHIP (Lag 0):
+   - Strong positive correlation indicates Fed Funds and CPI change simultaneously
+   - Fed reacts to current inflation conditions in real-time
+
+2. FED FUNDS LEADING INFLATION (Negative Lags: -1 to -15):
+   - Positive correlations show monetary policy changes precede inflation changes
+   - Policy transmission lag: 6-18 months for full effect
+   - Strongest effects at lags -1 to -5 (immediate to short-term)
+
+3. INFLATION LEADING FED FUNDS (Positive Lags: 1 to 10):
+   - Positive correlations show inflation changes precede policy responses
+   - Fed follows data-dependent approach with some reaction lag
+
+4. LONG-TERM REVERSAL (Lags 15-20):
+   - Negative correlations suggest cyclical correction pattern
+   - High inflation → policy tightening → inflation reversal
+
+IMPLICATIONS FOR VAR MODEL:
+- Use higher lag orders (15-20) to capture full dynamic relationship
+- Model shows bidirectional causality - VAR is appropriate
+- Consider seasonal VAR for 12-month patterns
+- Test for structural breaks around major policy changes
+
+#### **Train/Test Split**
+**Split the data into training and test sets for proper model validation.**
+
+```{r train_test_split}
+# ============================================================================
+# TRAIN/TEST SPLIT - Training up to December 2023, Test from January 2024
+# ============================================================================
+
+# Split the transformed, stationary data into training and test sets
+# Training: All data up to and including December 2023
+# Test: All observations from January 2024 onwards
+split_date <- as.Date("2023-12-31")
+
+# Find the index where we split the data
+split_index <- which(final_data$Date <= split_date)
+if(length(split_index) == 0) {
+  cat("ERROR: No data found before or on December 31, 2023\n")
+  cat("Available date range:", as.character(range(final_data$Date)), "\n")
+  stop("Cannot proceed with train/test split")
+}
+
+# Get the last training observation index
+last_train_index <- max(split_index)
+
+# Split the data
+train_data_final <- final_data[1:last_train_index, ]
+test_data_final <- final_data[(last_train_index + 1):nrow(final_data), ]
+
+# Display split information:
+print(split_date)
+# Number of observations in training and test sets:
+print(nrow(train_data_final))
+print(nrow(test_data_final))
+# First and last dates in training and test sets:
+print(train_data_final$Date[1])
+print(train_data_final$Date[nrow(train_data_final)])
+print(test_data_final$Date[1])
+print(test_data_final$Date[nrow(test_data_final)])
+```
+
+#### **Step 4**
+**Determine the appropriate lag order for the VAR model.**
+
+```{r step_4}
+# Create time series objects for VAR analysis using TRAINING DATA ONLY
+ts_train <- ts(train_data_final[, c("CPI", "FedFunds")],
+               start = c(1990, 2), frequency = 12)
+
+# Determine optimal lag order using TRAINING DATA ONLY
+
+lag_selection <- VARselect(ts_train, lag.max = 36, type = "const", season = 12)
+
+# Select optimal lag based on AIC and BIC (Note: VARselect referes to BIC as SC(n))
+optimal_lag_aic <- lag_selection$selection["AIC(n)"]
+optimal_lag_bic <- lag_selection$selection["SC(n)"]
+
+# Plot the information criteria to visualize lag selection
+par(mfrow = c(1, 1))
+max_lags <- ncol(lag_selection$criteria)
+plot(1:max_lags, lag_selection$criteria[1,], type = "l", col = "blue", lwd = 2,
+     xlab = "Lag Order", ylab = "Information Criterion", 
+     main = "Lag Order Selection Criteria",
+     ylim = range(c(lag_selection$criteria[1,], lag_selection$criteria[2,])))
+lines(1:max_lags, lag_selection$criteria[2,], col = "red", lwd = 2)
+legend("topright", legend = c("AIC", "BIC"), col = c("blue", "red"), lwd = 2)
+
+# Note: AIC tends to select higher lag orders, BIC tends to select lower lag orders.
+print(optimal_lag_aic)
+print(optimal_lag_bic)
+```
+
+#### **Step 5**
+**Fit two seasonal VAR models to the data using the optimal lag orders determined in Step 4.**  
+
+```{r step_5}
+# Fit VAR models with seasonal dummies using TRAINING DATA ONLY
+var_model_aic <- VAR(ts_train, p = optimal_lag_aic, type = "const", season = 12)
+var_model_bic <- VAR(ts_train, p = optimal_lag_bic, type = "const", season = 12)
+
+# Display model summaries
+print(summary(var_model_aic))
+print(summary(var_model_bic))
+```
+
+#### **Step 5.5**
+**Test for structural breaks and fit intervention VAR models to capture COVID-19 pandemic effects.**
+
+```{r step_5_5}
+# INTERVENTION PERIOD VISUALIZATION
+# Plot log-transformed CPI with intervention period markers
+par(mfrow = c(1, 1))
+plot(data$Date, log(data$CPI), type = "l", col = "blue", lwd = 2,
+     main = "Log(CPI) with COVID-19 Intervention Period", 
+     xlab = "Date", ylab = "Log(CPI)")
+
+# Define COVID-19 intervention period dates
+intervention_start <- as.Date("2020-12-01")
+intervention_end <- as.Date("2022-05-01")
+
+# Add vertical lines for intervention period
+abline(v = intervention_start, col = "red", lty = 2, lwd = 2)
+abline(v = intervention_end, col = "red", lty = 2, lwd = 2)
+
+# Add legend and labels
+legend("topleft", legend = c("Log(CPI)", "Intervention Start (December 2020)", "Intervention End (May 2022)"), 
+       col = c("blue", "red", "red"), lty = c(1, 2, 2), lwd = c(2, 2, 2))
+
+# Based on visual analysis and economic events, define intervention period
+intervention_start_date <- "2020-12"
+intervention_end_date <- "2022-05"
+
+# EMPIRICAL CONFIRMATION OF STRUCTURAL BREAK: Compare models with and without intervention
+# Create intervention variable for the defined period
+intervention_start_num <- as.numeric(as.yearmon(intervention_start_date))
+intervention_end_num <- as.numeric(as.yearmon(intervention_end_date))
+time_indices <- as.numeric(time(ts_train))
+
+# step intervention variable: 1 during intervention period, 0 otherwise
+intervention <- ifelse(time_indices >= intervention_start_num & time_indices <= intervention_end_num, 1, 0)
+
+# Create level shift intervention variable: 1 from intervention start onwards (permanent effect)
+intervention_level_shift <- ifelse(time_indices >= intervention_start_num, 1, 0)
+
+# Fit baseline VAR model (without intervention)
+baseline_var <- VAR(ts_train, p = optimal_lag_aic, type = "const", season = 12)
+
+# Fit step intervention VAR model (with intervention as exogenous variable)
+intervention_var <- VAR(ts_train, p = optimal_lag_aic, type = "const", season = 12, 
+                       exogen = matrix(intervention, ncol = 1))
+
+# Fit level shift intervention VAR model
+level_shift_var <- VAR(ts_train, p = optimal_lag_aic, type = "const", season = 12, 
+                       exogen = matrix(intervention_level_shift, ncol = 1))
+
+# Compare baseline and step intervention models using likelihood ratio test
+lr_test <- logLik(intervention_var) - logLik(baseline_var)
+lr_statistic <- 2 * lr_test
+lr_pvalue <- 1 - pchisq(lr_statistic, df = 2)  # 2 additional parameters (intervention effects)
+cat("Baseline vs. Step Intervention - LR statistic:", round(lr_statistic, 3), ", p-value:", round(lr_pvalue, 4), "\n")
+
+# Compare baseline and level shift intervention models using likelihood ratio test
+lr_test_level_shift <- logLik(level_shift_var) - logLik(baseline_var)
+lr_statistic_level_shift <- 2 * lr_test_level_shift
+lr_pvalue_level_shift <- 1 - pchisq(lr_statistic_level_shift, df = 2)
+cat("Baseline vs. Level Shift Intervention - LR statistic:", round(lr_statistic_level_shift, 3), ", p-value:", round(lr_pvalue_level_shift, 4), "\n")
+
+# Compare step and level shift intervention models using likelihood ratio test
+lr_test_comparison <- logLik(level_shift_var) - logLik(intervention_var)
+lr_statistic_comparison <- 2 * lr_test_comparison
+lr_pvalue_comparison <- 1 - pchisq(lr_statistic_comparison, df = 2)
+cat("Step vs. Level Shift Intervention - LR statistic:", round(lr_statistic_comparison, 3), ", p-value:", round(lr_pvalue_comparison, 4), "\n")
+```
+
+INTERVENTION EFFECT INTERPRETATION  
+The intervention variable captures structural changes during the COVID-19 period:  
+- Initial economic shock and uncertainty  
+- Unprecedented monetary policy responses  
+- Supply chain disruptions and inflation dynamics  
+- Recovery and policy normalization phases  
+
+The likelihood ratio test for both step and level shift intervention models is significant, confirming that the COVID-19 period represents a genuine structural break in the data generating process, justifying the use of an intervention model. There is not strong evidence to suggest a statistical difference between the two intervention models, but after comparing the likelihood ratio test results and analyzing the times series plots, there is a strong indication that the level shift intervention model is more appropriate.  
+
+#### **Step 5.5.1**
+**Fitting Intervention VAR Models**
+
+```{r step_5_5_1}
+
+# Fit VAR models with step intervention as exogenous variable
+var_model_aic_intervention <- VAR(ts_train, p = optimal_lag_aic, 
+                                  type = "const", season = 12, 
+                                  exogen = matrix(intervention, ncol = 1))
+
+var_model_bic_intervention <- VAR(ts_train, p = optimal_lag_bic, 
+                                  type = "const", season = 12, 
+                                  exogen = matrix(intervention, ncol = 1))
+
+# Fit VAR models with level shift intervention as exogenous variable
+var_model_aic_level_shift <- VAR(ts_train, p = optimal_lag_aic, 
+                                  type = "const", season = 12, 
+                                  exogen = matrix(intervention_level_shift, ncol = 1))
+
+var_model_bic_level_shift <- VAR(ts_train, p = optimal_lag_bic, 
+                                  type = "const", season = 12, 
+                                  exogen = matrix(intervention_level_shift, ncol = 1))
+
+# COMPREHENSIVE MODEL COMPARISON TABLE
+comparison_table <- data.frame(
+  Model_Type = c("Baseline", "Step Intervention", "Level Shift Intervention"),
+  Lag_AIC_Optimal = c(optimal_lag_aic, optimal_lag_aic, optimal_lag_aic),
+  AIC_AIC_Optimal = c(AIC(var_model_aic), AIC(var_model_aic_intervention), AIC(var_model_aic_level_shift)),
+  BIC_AIC_Optimal = c(BIC(var_model_aic), BIC(var_model_aic_intervention), BIC(var_model_aic_level_shift)),
+  Lag_BIC_Optimal = c(optimal_lag_bic, optimal_lag_bic, optimal_lag_bic),
+  AIC_BIC_Optimal = c(AIC(var_model_bic), AIC(var_model_bic_intervention), AIC(var_model_bic_level_shift)),
+  BIC_BIC_Optimal = c(BIC(var_model_bic), BIC(var_model_bic_intervention), BIC(var_model_bic_level_shift)),
+  Adj_R2_CPI = c(summary(var_model_aic)$varresult[[1]]$adj.r.squared, summary(var_model_aic_intervention)$varresult[[1]]$adj.r.squared, summary(var_model_aic_level_shift)$varresult[[1]]$adj.r.squared),
+  Adj_R2_FedFunds = c(summary(var_model_aic)$varresult[[2]]$adj.r.squared, summary(var_model_aic_intervention)$varresult[[2]]$adj.r.squared, summary(var_model_aic_level_shift)$varresult[[2]]$adj.r.squared),
+  Adj_R2_CPI_BIC = c(summary(var_model_bic)$varresult[[1]]$adj.r.squared, summary(var_model_bic_intervention)$varresult[[1]]$adj.r.squared, summary(var_model_bic_level_shift)$varresult[[1]]$adj.r.squared),
+  Adj_R2_FedFunds_BIC = c(summary(var_model_bic)$varresult[[2]]$adj.r.squared, summary(var_model_bic_intervention)$varresult[[2]]$adj.r.squared, summary(var_model_bic_level_shift)$varresult[[2]]$adj.r.squared)
+)
+
+# Print the comparison table
+print(comparison_table)
+
+# Print summaries of the step intervention models:
+print(summary(var_model_aic_intervention))
+print(summary(var_model_bic_intervention))
+
+# Print summaries of the level shift intervention models:
+print(summary(var_model_aic_level_shift))
+print(summary(var_model_bic_level_shift))
+```
+
+Based on the AIC and BIC values, as well as multiple R squared values, the step intervention model is preferrable to the level shift intervention model. Between lag orders of 2 and 3, metrics for the step intervention models are all very close, but given that the adjusted r-squared takes into account model complexity and still shows a nearly half percent improvement for the CPI model and 2 percent improvement for the Fed Funds model, we will move forward with the lag order 3.  
+
+
+
+#### **Step 6**
+**Cross Validation for Non-Intervention Models (Full Training Set)** 
+```{r step_6}
+# ============================================================================
+# CROSS-VALIDATION FOR VAR MODELS WITH LAG ORDER 3
+# ============================================================================
+# Testing lag 3 baseline VAR model
+# 20-year sliding window, 1-month steps, 12-month forecast horizon
+# ============================================================================
+
+
+
+# Set up parameters
+k <- 240  # train_window_size: 20 years = 240 months
+s <- 1    # 1-month steps
+H <- 12    # 12-month forecast horizon
+n <- nrow(ts_train) # Get the total number of observations in training data
+p <- 12 # Period
+# Get start time of the series
+st <- tsp(ts_train)[1]+(k-2)/p # gives the start time in time units
+
+# Define intervention period (COVID-19: Dec 2020 - May 2022)
+intervention_start <- as.yearmon("2020-12")
+intervention_end <- as.yearmon("2022-05")
+
+cat("Using baseline VAR model (no intervention) for cross-validation\n")
+
+# ============================================================================
+# INITIALIZE STORAGE FOR RESULTS
+# ============================================================================
+
+# Calculate exact number of iterations
+# We need H observations for test set, so last valid iteration is when we can get full test set
+max_iterations <- n - k - H + 1
+cat("Calculated iterations:", max_iterations, "\n")
+
+# Initialize matrices for storing results  
+mae_baseline_cpi <- matrix(NA, max_iterations, H)
+rmse_baseline_cpi <- matrix(NA, max_iterations, H)
+mae_baseline_fedfunds <- matrix(NA, max_iterations, H)
+rmse_baseline_fedfunds <- matrix(NA, max_iterations, H)
+aic_baseline <- numeric(max_iterations)
+bic_baseline <- numeric(max_iterations)
+adj_r2_baseline_cpi <- numeric(max_iterations)
+adj_r2_baseline_fedfunds <- numeric(max_iterations)
+
+```
+
+```{r step_6_loop}
+for(i in 1:max_iterations)
+{
+  # Sliding Window - keep the training window of fixed length
+  train <- window(ts_train, start=st+(i-k+1)/p, end=st+i/p) ## Window Length: k
+  
+  test <- window(ts_train, start=st + (i+1)/p, end=st + (i+H)/p) ## Window Length: H
+  
+  # Fit baseline VAR model (no intervention)
+  fit_baseline <- VAR(train, p = 3, type = "const", season = 12)
+  fcast_baseline <- predict(fit_baseline, n.ahead = H)
+  
+  # Calculate errors for both variables
+  # Extract forecasts for both variables
+  fcast_cpi <- as.numeric(fcast_baseline[['fcst']][[1]][,1])      # CPI forecasts
+  fcast_fedfunds <- as.numeric(fcast_baseline[['fcst']][[2]][,1]) # FedFunds forecasts
+  test_cpi <- as.numeric(test[,1])       # CPI test data
+  test_fedfunds <- as.numeric(test[,2])  # FedFunds test data
+  
+  # Store forecast errors for both variables
+  mae_baseline_cpi[i,] <- abs(fcast_cpi - test_cpi)
+  rmse_baseline_cpi[i,] <- (fcast_cpi - test_cpi)^2
+  mae_baseline_fedfunds[i,] <- abs(fcast_fedfunds - test_fedfunds)
+  rmse_baseline_fedfunds[i,] <- (fcast_fedfunds - test_fedfunds)^2
+
+  # Store AIC and BIC values for baseline model
+  aic_baseline[i] <- AIC(fit_baseline)
+  bic_baseline[i] <- BIC(fit_baseline)
+  
+  # Calculate adjusted R² for each variable equation
+  adj_r2_baseline_cpi[i] <- summary(fit_baseline)$varresult[[1]]$adj.r.squared
+  adj_r2_baseline_fedfunds[i] <- summary(fit_baseline)$varresult[[2]]$adj.r.squared
+
+}
+
+```
+
+```{r step_6_mean_metrics}
+# Calculate mean MAE and RMSE across iterations for each horizon and variable
+mean_mae_baseline_cpi <- colMeans(mae_baseline_cpi, na.rm=TRUE)
+mean_rmse_baseline_cpi <- sqrt(colMeans(rmse_baseline_cpi, na.rm=TRUE))
+mean_mae_baseline_fedfunds <- colMeans(mae_baseline_fedfunds, na.rm=TRUE)
+mean_rmse_baseline_fedfunds <- sqrt(colMeans(rmse_baseline_fedfunds, na.rm=TRUE))
+
+# Calculate mean AIC, BIC, and Adj R² values
+mean_aic_baseline <- mean(aic_baseline, na.rm=TRUE)
+mean_bic_baseline <- mean(bic_baseline, na.rm=TRUE)
+mean_adj_r2_cpi <- mean(adj_r2_baseline_cpi, na.rm=TRUE)
+mean_adj_r2_fedfunds <- mean(adj_r2_baseline_fedfunds, na.rm=TRUE)
+```
+
+```{r step_6_plots}
+# Create plots - Baseline VAR Models (Lag 3)
+
+par(mfrow=c(3,3))
+
+# Row 1: MAE vs forecast horizon
+plot(1:H, mean_mae_baseline_cpi, type="l", col="blue", lwd=2, 
+     main="MAE vs Forecast Horizon", xlab="Horizon", ylab="MAE",
+     ylim=range(c(mean_mae_baseline_cpi, mean_mae_baseline_fedfunds)))
+lines(1:H, mean_mae_baseline_fedfunds, col="red", lwd=2)
+
+# Row 1: RMSE vs forecast horizon
+plot(1:H, mean_rmse_baseline_cpi, type="l", col="blue", lwd=2,
+     main="RMSE vs Forecast Horizon", xlab="Horizon", ylab="RMSE",
+     ylim=range(c(mean_rmse_baseline_cpi, mean_rmse_baseline_fedfunds)))
+lines(1:H, mean_rmse_baseline_fedfunds, col="red", lwd=2)
+
+# Row 1: Leave blank (placeholder)
+plot.new()
+
+# Row 2: AIC vs iteration number with upper bound label
+plot(seq_along(aic_baseline), aic_baseline, type="l", col="green", lwd=2,
+     main="AIC vs Iteration - Baseline VAR", xlab="Iteration", ylab="AIC")
+text(length(aic_baseline) * 0.8, max(aic_baseline, na.rm=TRUE) * 0.95, 
+     paste("Max:", round(max(aic_baseline, na.rm=TRUE), 1)), adj=0, cex=0.8)
+
+# Row 2: BIC vs iteration number with upper bound label
+plot(seq_along(bic_baseline), bic_baseline, type="l", col="orange", lwd=2,
+     main="BIC vs Iteration - Baseline VAR", xlab="Iteration", ylab="BIC")
+text(length(bic_baseline) * 0.8, max(bic_baseline, na.rm=TRUE) * 0.95, 
+     paste("Max:", round(max(bic_baseline, na.rm=TRUE), 1)), adj=0, cex=0.8)
+
+# Row 2: Legend for all plots - formatted to show all variables clearly
+plot.new()
+legend("center", legend=c("CPI", "FedFunds"), 
+       col=c("blue", "red"), lwd=3, cex=1.0, 
+       ncol=1, bty="n", x.intersp=0.5, y.intersp=0.8)
+
+# Row 3: MAE by iteration (1-step ahead)
+mae_1step_cpi <- mae_baseline_cpi[,1]  # 1-step ahead MAE for CPI
+mae_1step_fedfunds <- mae_baseline_fedfunds[,1]  # 1-step ahead MAE for FedFunds
+plot(seq_along(mae_1step_cpi), mae_1step_cpi, type="l", col="blue", lwd=2,
+     main="MAE (1-step) vs Iteration", xlab="Iteration", ylab="MAE",
+     ylim=range(c(mae_1step_cpi, mae_1step_fedfunds)))
+lines(seq_along(mae_1step_fedfunds), mae_1step_fedfunds, col="red", lwd=2)
+
+# Row 3: RMSE by iteration (1-step ahead)
+rmse_1step_cpi <- sqrt(rmse_baseline_cpi[,1])  # 1-step ahead RMSE for CPI
+rmse_1step_fedfunds <- sqrt(rmse_baseline_fedfunds[,1])  # 1-step ahead RMSE for FedFunds
+plot(seq_along(rmse_1step_cpi), rmse_1step_cpi, type="l", col="blue", lwd=2,
+     main="RMSE (1-step) vs Iteration", xlab="Iteration", ylab="RMSE",
+     ylim=range(c(rmse_1step_cpi, rmse_1step_fedfunds)))
+lines(seq_along(rmse_1step_fedfunds), rmse_1step_fedfunds, col="red", lwd=2)
+
+# Row 3: Adjusted R² vs iteration
+plot(seq_along(adj_r2_baseline_cpi), adj_r2_baseline_cpi, type="l", col="blue", lwd=2,
+     main="Adjusted R² vs Iteration", xlab="Iteration", ylab="Adjusted R²",
+     ylim=range(c(adj_r2_baseline_cpi, adj_r2_baseline_fedfunds)))
+lines(seq_along(adj_r2_baseline_fedfunds), adj_r2_baseline_fedfunds, col="red", lwd=2)
+```
+
+```{r step_6_summary}
+# Summary plot for Step 6
+plot.new()
+text(0.5, 0.9, "Baseline VAR Model Performance Summary", font=2, cex=1.2)
+
+text(0.05, 0.8, "Cross-Validation Results:", font=2, cex=1, adj=0)
+text(0.05, 0.75, paste("Total Iterations:", length(aic_baseline)), cex=0.9, adj=0)
+text(0.05, 0.7, paste("Training Window:", k, "months (20 years)"), cex=0.9, adj=0)
+text(0.05, 0.65, paste("Forecast Horizon:", H, "months"), cex=0.9, adj=0)
+
+text(0.05, 0.55, "Mean Performance Metrics:", font=2, cex=1, adj=0)
+text(0.05, 0.5, paste("Mean MAE CPI:", round(mean(mean_mae_baseline_cpi), 3)), cex=0.9, adj=0)
+text(0.05, 0.45, paste("Mean MAE FedFunds:", round(mean(mean_mae_baseline_fedfunds), 3)), cex=0.9, adj=0)
+text(0.05, 0.4, paste("Mean RMSE CPI:", round(mean(mean_rmse_baseline_cpi), 3)), cex=0.9, adj=0)
+text(0.05, 0.35, paste("Mean RMSE FedFunds:", round(mean(mean_rmse_baseline_fedfunds), 3)), cex=0.9, adj=0)
+
+text(0.55, 0.55, "Model Selection Metrics:", font=2, cex=1, adj=0)
+text(0.55, 0.5, paste("Mean AIC:", round(mean(aic_baseline), 2)), cex=0.9, adj=0)
+text(0.55, 0.45, paste("Mean BIC:", round(mean(bic_baseline), 2)), cex=0.9, adj=0)
+text(0.55, 0.4, paste("Mean Adj R² CPI:", round(mean(adj_r2_baseline_cpi), 3)), cex=0.9, adj=0)
+text(0.55, 0.35, paste("Mean Adj R² FedFunds:", round(mean(adj_r2_baseline_fedfunds), 3)), cex=0.9, adj=0)
+
+text(0.05, 0.25, "Notes:", font=2, cex=1, adj=0)
+text(0.05, 0.2, "• Baseline VAR(3) model with seasonal components", cex=0.8, adj=0)
+text(0.05, 0.15, "• 20-year rolling window, 1-month step", cex=0.8, adj=0)
+text(0.05, 0.1, "• No intervention variables included", cex=0.8, adj=0)
+
+```
+
+#### **Step 7**
+**Cross-validation results for baseline - limited to pre-intervention period**
+
+```{r step_7}
+# ============================================================================
+# CROSS-VALIDATION PARAMETERS FOR PRE-INTERVENTION PERIOD
+# ============================================================================
+
+# Find the last iteration before intervention period starts
+intervention_start_time <- as.numeric(as.yearmon("2020-12"))
+max_pre_intervention_time <- intervention_start_time - H/12  # Leave buffer for forecast horizon
+
+# Calculate how many iterations we can do before intervention
+# We need to find the last training window that ends before intervention starts
+max_pre_iterations <- 0
+for(test_i in 1:(n-k)) {
+  test_end_time <- st + test_i/p
+  if (test_end_time + H/p <= intervention_start_time) {
+    max_pre_iterations <- test_i
+  } else {
+    break
+  }
+}
+
+cat("Pre-intervention iterations:", max_pre_iterations, "\n")
+cat("Last pre-intervention test period ends:", as.character(as.yearmon(st + max_pre_iterations/p + H/p)), "\n")
+
+# Initialize matrices for storing pre-intervention results  
+mae_pre_cpi <- matrix(NA, max_pre_iterations, H)
+rmse_pre_cpi <- matrix(NA, max_pre_iterations, H)
+mae_pre_fedfunds <- matrix(NA, max_pre_iterations, H)
+rmse_pre_fedfunds <- matrix(NA, max_pre_iterations, H)
+aic_pre <- numeric(max_pre_iterations)
+bic_pre <- numeric(max_pre_iterations)
+adj_r2_pre_cpi <- numeric(max_pre_iterations)
+adj_r2_pre_fedfunds <- numeric(max_pre_iterations)
+
+# Cross-validation loop for pre-intervention period
+for(i in 1:max_pre_iterations)
+{
+  # Sliding Window - keep the training window of fixed length
+  train <- window(ts_train, start=st+(i-k+1)/p, end=st+i/p) ## Window Length: k
+  
+  test <- window(ts_train, start=st + (i+1)/p, end=st + (i+H)/p) ## Window Length: H
+  
+  # Fit baseline VAR model (no intervention)
+  fit_baseline <- VAR(train, p = 3, type = "const", season = 12)
+  fcast_baseline <- predict(fit_baseline, n.ahead = H)
+  
+  # Calculate errors for both variables
+  # Extract forecasts for both variables
+  fcast_cpi <- as.numeric(fcast_baseline[['fcst']][[1]][,1])      # CPI forecasts
+  fcast_fedfunds <- as.numeric(fcast_baseline[['fcst']][[2]][,1]) # FedFunds forecasts
+  test_cpi <- as.numeric(test[,1])       # CPI test data
+  test_fedfunds <- as.numeric(test[,2])  # FedFunds test data
+  
+  # Store forecast errors for both variables
+  mae_pre_cpi[i,] <- abs(fcast_cpi - test_cpi)
+  rmse_pre_cpi[i,] <- (fcast_cpi - test_cpi)^2
+  mae_pre_fedfunds[i,] <- abs(fcast_fedfunds - test_fedfunds)
+  rmse_pre_fedfunds[i,] <- (fcast_fedfunds - test_fedfunds)^2
+
+  # Store AIC and BIC values for baseline model
+  aic_pre[i] <- AIC(fit_baseline)
+  bic_pre[i] <- BIC(fit_baseline)
+  
+  # Calculate adjusted R² for each variable equation
+  adj_r2_pre_cpi[i] <- summary(fit_baseline)$varresult[[1]]$adj.r.squared
+  adj_r2_pre_fedfunds[i] <- summary(fit_baseline)$varresult[[2]]$adj.r.squared
+}
+
+# Calculate mean metrics
+mean_mae_pre_cpi <- colMeans(mae_pre_cpi, na.rm=TRUE)
+mean_rmse_pre_cpi <- sqrt(colMeans(rmse_pre_cpi, na.rm=TRUE))
+mean_mae_pre_fedfunds <- colMeans(mae_pre_fedfunds, na.rm=TRUE)
+mean_rmse_pre_fedfunds <- sqrt(colMeans(rmse_pre_fedfunds, na.rm=TRUE))
+
+# Create plots for pre-intervention period
+par(mfrow=c(3,3))
+
+# Row 1: MAE vs forecast horizon
+plot(1:H, mean_mae_pre_cpi, type="l", col="blue", lwd=2, 
+     main="MAE vs Horizon (Pre-Intervention)", xlab="Horizon", ylab="MAE",
+     ylim=range(c(mean_mae_pre_cpi, mean_mae_pre_fedfunds)))
+lines(1:H, mean_mae_pre_fedfunds, col="red", lwd=2)
+
+# Row 1: RMSE vs forecast horizon
+plot(1:H, mean_rmse_pre_cpi, type="l", col="blue", lwd=2,
+     main="RMSE vs Horizon (Pre-Intervention)", xlab="Horizon", ylab="RMSE",
+     ylim=range(c(mean_rmse_pre_cpi, mean_rmse_pre_fedfunds)))
+lines(1:H, mean_rmse_pre_fedfunds, col="red", lwd=2)
+
+# Row 1: Leave blank (placeholder)
+plot.new()
+
+# Row 2: AIC vs iteration number with upper bound label
+plot(seq_along(aic_pre), aic_pre, type="l", col="green", lwd=2,
+     main="AIC vs Iteration (Pre-Intervention)", xlab="Iteration", ylab="AIC")
+text(length(aic_pre) * 0.8, max(aic_pre, na.rm=TRUE) * 0.95, 
+     paste("Max:", round(max(aic_pre, na.rm=TRUE), 1)), adj=0, cex=0.8)
+
+# Row 2: BIC vs iteration number with upper bound label
+plot(seq_along(bic_pre), bic_pre, type="l", col="orange", lwd=2,
+     main="BIC vs Iteration (Pre-Intervention)", xlab="Iteration", ylab="BIC")
+text(length(bic_pre) * 0.8, max(bic_pre, na.rm=TRUE) * 0.95, 
+     paste("Max:", round(max(bic_pre, na.rm=TRUE), 1)), adj=0, cex=0.8)
+
+# Row 2: Legend for all plots - formatted to show all variables clearly
+plot.new()
+legend("center", legend=c("CPI", "FedFunds"), 
+       col=c("blue", "red"), lwd=3, cex=1.0, 
+       ncol=1, bty="n", x.intersp=0.5, y.intersp=0.8)
+
+# Row 3: MAE by iteration (1-step ahead)
+mae_1step_pre_cpi <- mae_pre_cpi[,1]  # 1-step ahead MAE for CPI
+mae_1step_pre_fedfunds <- mae_pre_fedfunds[,1]  # 1-step ahead MAE for FedFunds
+plot(seq_along(mae_1step_pre_cpi), mae_1step_pre_cpi, type="l", col="blue", lwd=2,
+     main="MAE (1-step) vs Iteration (Pre-Intervention)", xlab="Iteration", ylab="MAE",
+     ylim=range(c(mae_1step_pre_cpi, mae_1step_pre_fedfunds)))
+lines(seq_along(mae_1step_pre_fedfunds), mae_1step_pre_fedfunds, col="red", lwd=2)
+
+# Row 3: RMSE by iteration (1-step ahead)
+rmse_1step_pre_cpi <- sqrt(rmse_pre_cpi[,1])  # 1-step ahead RMSE for CPI
+rmse_1step_pre_fedfunds <- sqrt(rmse_pre_fedfunds[,1])  # 1-step ahead RMSE for FedFunds
+plot(seq_along(rmse_1step_pre_cpi), rmse_1step_pre_cpi, type="l", col="blue", lwd=2,
+     main="RMSE (1-step) vs Iteration (Pre-Intervention)", xlab="Iteration", ylab="RMSE",
+     ylim=range(c(rmse_1step_pre_cpi, rmse_1step_pre_fedfunds)))
+lines(seq_along(rmse_1step_pre_fedfunds), rmse_1step_pre_fedfunds, col="red", lwd=2)
+
+# Row 3: Adjusted R² vs iteration
+plot(seq_along(adj_r2_pre_cpi), adj_r2_pre_cpi, type="l", col="blue", lwd=2,
+     main="Adj R² vs Iteration (Pre-Intervention)", xlab="Iteration", ylab="Adjusted R²",
+     ylim=range(c(adj_r2_pre_cpi, adj_r2_pre_fedfunds)))
+lines(seq_along(adj_r2_pre_fedfunds), adj_r2_pre_fedfunds, col="red", lwd=2)
+
+```
+
+```{r step_7_summary}
+# Summary plot for Step 7
+plot.new()
+text(0.5, 0.9, "Pre-Intervention Model Performance Summary", font=2, cex=1.2)
+text(0.05, 0.8, paste("Iterations:", max_pre_iterations), adj=0)
+text(0.05, 0.75, paste("Training Window:", k, "months"), adj=0)
+text(0.05, 0.7, paste("Forecast Horizon:", H, "months"), adj=0)
+text(0.05, 0.6, paste("Mean MAE CPI:", round(mean(mean_mae_pre_cpi), 3)), adj=0)
+text(0.05, 0.55, paste("Mean RMSE CPI:", round(mean(mean_rmse_pre_cpi), 3)), adj=0)
+text(0.05, 0.5, paste("Mean MAE FedFunds:", round(mean(mean_mae_pre_fedfunds), 3)), adj=0)
+text(0.05, 0.45, paste("Mean RMSE FedFunds:", round(mean(mean_rmse_pre_fedfunds), 3)), adj=0)
+text(0.55, 0.6, paste("Mean AIC:", round(mean(aic_pre), 2)), adj=0)
+text(0.55, 0.55, paste("Mean BIC:", round(mean(bic_pre), 2)), adj=0)
+text(0.55, 0.5, paste("Mean Adj R² CPI:", round(mean(adj_r2_pre_cpi), 3)), adj=0)
+text(0.55, 0.45, paste("Mean Adj R² FedFunds:", round(mean(adj_r2_pre_fedfunds), 3)), adj=0)
+```
+
+#### **Step 8**
+**Cross-validation for step intervention - beginning with first intervention date**
+
+```{r step_8}
+# ============================================================================
+# CROSS-VALIDATION PARAMETERS FOR INTERVENTION PERIOD
+# ============================================================================
+
+# Re-add intervention variable to ts_train for intervention models
+time_indices <- as.numeric(time(ts_train))
+intervention_start_num <- as.numeric(intervention_start)
+intervention_end_num <- as.numeric(intervention_end)
+
+intervention_var <- ifelse(time_indices >= intervention_start_num & 
+                          time_indices <= intervention_end_num, 1, 0)
+
+# Add intervention variable to ts_train
+ts_train_with_intervention <- cbind(ts_train, intervention_var)
+colnames(ts_train_with_intervention)[ncol(ts_train_with_intervention)] <- "intervention"
+
+# Find the first iteration where training window contains intervention data
+min_intervention_iterations <- 0
+for(test_i in 1:(n-k)) {
+  train_start <- st + (test_i - k + 1)/p
+  train_end <- st + test_i/p
+  
+  # Check if this training window contains any intervention data
+  train_window <- window(ts_train_with_intervention, start=train_start, end=train_end)
+  intervention_count <- sum(train_window[, "intervention"])
+  
+  if (intervention_count > 0) {
+    min_intervention_iterations <- test_i
+    cat("First intervention window found at iteration:", test_i, "\n")
+    cat("Training window:", as.character(as.yearmon(train_start)), "to", as.character(as.yearmon(train_end)), "\n")
+    cat("Intervention observations:", intervention_count, "out of", nrow(train_window), "\n")
+    break
+  }
+}
+
+# Calculate maximum iterations (leaving room for test set)
+max_intervention_iterations <- n - k - H + 1
+intervention_iterations <- max_intervention_iterations - min_intervention_iterations + 1
+
+cat("Intervention cross-validation range:", min_intervention_iterations, "to", max_intervention_iterations, "\n")
+cat("Total intervention iterations:", intervention_iterations, "\n")
+
+# Initialize matrices for storing intervention results  
+mae_intervention_cpi <- matrix(NA, intervention_iterations, H)
+rmse_intervention_cpi <- matrix(NA, intervention_iterations, H)
+mae_intervention_fedfunds <- matrix(NA, intervention_iterations, H)
+rmse_intervention_fedfunds <- matrix(NA, intervention_iterations, H)
+aic_intervention <- numeric(intervention_iterations)
+bic_intervention <- numeric(intervention_iterations)
+adj_r2_intervention_cpi <- numeric(intervention_iterations)
+adj_r2_intervention_fedfunds <- numeric(intervention_iterations)
+
+# Cross-validation loop for intervention period
+for(i in min_intervention_iterations:max_intervention_iterations)
+{
+  # Array index for storing results
+  store_idx <- i - min_intervention_iterations + 1
+  
+  # Sliding Window - keep the training window of fixed length
+  train <- window(ts_train_with_intervention, start=st+(i-k+1)/p, end=st+i/p) ## Window Length: k
+  test <- window(ts_train_with_intervention, start=st + (i+1)/p, end=st + (i+H)/p) ## Window Length: H
+  
+  # Extract intervention variable from training data
+  train_intervention <- train[, "intervention"]
+  
+  # Create intervention variable for forecast period (H periods ahead)
+  forecast_start_time <- time(test)[1]
+  forecast_end_time <- time(test)[length(time(test))]
+  
+  # Create intervention values for the forecast horizon
+  forecast_intervention <- rep(0, H)  # Default to 0 (no intervention)
+  
+  # Check if forecast period overlaps with intervention period
+  if (forecast_start_time <= intervention_end_num && forecast_end_time >= intervention_start_num) {
+    # There's overlap, set intervention to 1 for overlapping periods
+    forecast_intervention <- rep(1, H)
+  }
+  
+  # Fit intervention VAR model
+  fit_intervention <- VAR(train[, 1:2], p = 3, type = "const", season = 12, 
+                         exogen = matrix(train_intervention, ncol = 1))
+  fcast_intervention <- predict(fit_intervention, n.ahead = H, 
+                               dumvar = matrix(forecast_intervention, ncol = 1))
+  
+  # Calculate errors for both variables
+  # Extract forecasts for both variables
+  fcast_cpi <- as.numeric(fcast_intervention[['fcst']][[1]][,1])      # CPI forecasts
+  fcast_fedfunds <- as.numeric(fcast_intervention[['fcst']][[2]][,1]) # FedFunds forecasts
+  test_cpi <- as.numeric(test[,1])       # CPI test data
+  test_fedfunds <- as.numeric(test[,2])  # FedFunds test data
+  
+  # Store forecast errors for both variables
+  mae_intervention_cpi[store_idx,] <- abs(fcast_cpi - test_cpi)
+  rmse_intervention_cpi[store_idx,] <- (fcast_cpi - test_cpi)^2
+  mae_intervention_fedfunds[store_idx,] <- abs(fcast_fedfunds - test_fedfunds)
+  rmse_intervention_fedfunds[store_idx,] <- (fcast_fedfunds - test_fedfunds)^2
+
+  # Store AIC and BIC values for intervention model
+  aic_intervention[store_idx] <- AIC(fit_intervention)
+  bic_intervention[store_idx] <- BIC(fit_intervention)
+  
+  # Calculate adjusted R² for each variable equation
+  adj_r2_intervention_cpi[store_idx] <- summary(fit_intervention)$varresult[[1]]$adj.r.squared
+  adj_r2_intervention_fedfunds[store_idx] <- summary(fit_intervention)$varresult[[2]]$adj.r.squared
+}
+
+# Calculate mean metrics
+mean_mae_intervention_cpi <- colMeans(mae_intervention_cpi, na.rm=TRUE)
+mean_rmse_intervention_cpi <- sqrt(colMeans(rmse_intervention_cpi, na.rm=TRUE))
+mean_mae_intervention_fedfunds <- colMeans(mae_intervention_fedfunds, na.rm=TRUE)
+mean_rmse_intervention_fedfunds <- sqrt(colMeans(rmse_intervention_fedfunds, na.rm=TRUE))
+
+# Create plots for intervention period
+par(mfrow=c(3,3))
+
+# Row 1: MAE vs forecast horizon
+plot(1:H, mean_mae_intervention_cpi, type="l", col="blue", lwd=2, 
+     main="MAE vs Horizon (Intervention)", xlab="Horizon", ylab="MAE",
+     ylim=range(c(mean_mae_intervention_cpi, mean_mae_intervention_fedfunds)))
+lines(1:H, mean_mae_intervention_fedfunds, col="red", lwd=2)
+
+# Row 1: RMSE vs forecast horizon
+plot(1:H, mean_rmse_intervention_cpi, type="l", col="blue", lwd=2,
+     main="RMSE vs Horizon (Intervention)", xlab="Horizon", ylab="RMSE",
+     ylim=range(c(mean_rmse_intervention_cpi, mean_rmse_intervention_fedfunds)))
+lines(1:H, mean_rmse_intervention_fedfunds, col="red", lwd=2)
+
+# Row 1: Leave blank (placeholder)
+plot.new()
+
+# Row 2: AIC vs iteration number with upper bound label
+plot(seq_along(aic_intervention), aic_intervention, type="l", col="green", lwd=2,
+     main="AIC vs Iteration (Intervention)", xlab="Iteration", ylab="AIC")
+text(length(aic_intervention) * 0.8, max(aic_intervention, na.rm=TRUE) * 0.95, 
+     paste("Max:", round(max(aic_intervention, na.rm=TRUE), 1)), adj=0, cex=0.8)
+
+# Row 2: BIC vs iteration number with upper bound label
+plot(seq_along(bic_intervention), bic_intervention, type="l", col="orange", lwd=2,
+     main="BIC vs Iteration (Intervention)", xlab="Iteration", ylab="BIC")
+text(length(bic_intervention) * 0.8, max(bic_intervention, na.rm=TRUE) * 0.95, 
+     paste("Max:", round(max(bic_intervention, na.rm=TRUE), 1)), adj=0, cex=0.8)
+
+# Row 2: Legend for all plots - formatted to show all variables clearly
+plot.new()
+legend("center", legend=c("CPI", "FedFunds"), 
+       col=c("blue", "red"), lwd=3, cex=1.0, 
+       ncol=1, bty="n", x.intersp=0.5, y.intersp=0.8)
+
+# Row 3: MAE by iteration (1-step ahead)
+mae_1step_intervention_cpi <- mae_intervention_cpi[,1]  # 1-step ahead MAE for CPI
+mae_1step_intervention_fedfunds <- mae_intervention_fedfunds[,1]  # 1-step ahead MAE for FedFunds
+plot(seq_along(mae_1step_intervention_cpi), mae_1step_intervention_cpi, type="l", col="blue", lwd=2,
+     main="MAE (1-step) vs Iteration (Intervention)", xlab="Iteration", ylab="MAE",
+     ylim=range(c(mae_1step_intervention_cpi, mae_1step_intervention_fedfunds)))
+lines(seq_along(mae_1step_intervention_fedfunds), mae_1step_intervention_fedfunds, col="red", lwd=2)
+
+# Row 3: RMSE by iteration (1-step ahead)
+rmse_1step_intervention_cpi <- sqrt(rmse_intervention_cpi[,1])  # 1-step ahead RMSE for CPI
+rmse_1step_intervention_fedfunds <- sqrt(rmse_intervention_fedfunds[,1])  # 1-step ahead RMSE for FedFunds
+plot(seq_along(rmse_1step_intervention_cpi), rmse_1step_intervention_cpi, type="l", col="blue", lwd=2,
+     main="RMSE (1-step) vs Iteration (Intervention)", xlab="Iteration", ylab="RMSE",
+     ylim=range(c(rmse_1step_intervention_cpi, rmse_1step_intervention_fedfunds)))
+lines(seq_along(rmse_1step_intervention_fedfunds), rmse_1step_intervention_fedfunds, col="red", lwd=2)
+
+# Row 3: Adjusted R² vs iteration
+plot(seq_along(adj_r2_intervention_cpi), adj_r2_intervention_cpi, type="l", col="blue", lwd=2,
+     main="Adj R² vs Iteration (Intervention)", xlab="Iteration", ylab="Adjusted R²",
+     ylim=range(c(adj_r2_intervention_cpi, adj_r2_intervention_fedfunds)))
+lines(seq_along(adj_r2_intervention_fedfunds), adj_r2_intervention_fedfunds, col="red", lwd=2)
+
+```
+
+```{r step_8_summary}
+# Summary plot for Step 8
+plot.new()
+text(0.5, 0.9, "Intervention Model Performance Summary", font=2, cex=1.2)
+text(0.05, 0.8, paste("Iterations:", intervention_iterations), adj=0)
+text(0.05, 0.75, paste("Training Window:", k, "months"), adj=0)
+text(0.05, 0.7, paste("Forecast Horizon:", H, "months"), adj=0)
+text(0.05, 0.6, paste("Mean MAE CPI:", round(mean(mean_mae_intervention_cpi), 3)), adj=0)
+text(0.05, 0.55, paste("Mean RMSE CPI:", round(mean(mean_rmse_intervention_cpi), 3)), adj=0)
+text(0.05, 0.5, paste("Mean MAE FedFunds:", round(mean(mean_mae_intervention_fedfunds), 3)), adj=0)
+text(0.05, 0.45, paste("Mean RMSE FedFunds:", round(mean(mean_rmse_intervention_fedfunds), 3)), adj=0)
+text(0.55, 0.6, paste("Mean AIC:", round(mean(aic_intervention), 2)), adj=0)
+text(0.55, 0.55, paste("Mean BIC:", round(mean(bic_intervention), 2)), adj=0)
+text(0.55, 0.5, paste("Mean Adj R² CPI:", round(mean(adj_r2_intervention_cpi), 3)), adj=0)
+text(0.55, 0.45, paste("Mean Adj R² FedFunds:", round(mean(adj_r2_intervention_fedfunds), 3)), adj=0)
+```
+
+#### **Step 9**
+**Combine baseline and step intervention cross-validation results for appropriate time periods**
+
+```{r step_9}
+# ============================================================================
+# COMBINE PRE-INTERVENTION AND INTERVENTION RESULTS
+# ============================================================================
+
+# Combine all result matrices
+combined_mae_cpi <- rbind(mae_pre_cpi, mae_intervention_cpi)
+combined_rmse_cpi <- rbind(rmse_pre_cpi, rmse_intervention_cpi)
+combined_mae_fedfunds <- rbind(mae_pre_fedfunds, mae_intervention_fedfunds)
+combined_rmse_fedfunds <- rbind(rmse_pre_fedfunds, rmse_intervention_fedfunds)
+
+# Combine scalar metrics
+combined_aic <- c(aic_pre, aic_intervention)
+combined_bic <- c(bic_pre, bic_intervention)
+combined_adj_r2_cpi <- c(adj_r2_pre_cpi, adj_r2_intervention_cpi)
+combined_adj_r2_fedfunds <- c(adj_r2_pre_fedfunds, adj_r2_intervention_fedfunds)
+
+# Calculate combined mean metrics
+combined_mean_mae_cpi <- colMeans(combined_mae_cpi, na.rm=TRUE)
+combined_mean_rmse_cpi <- sqrt(colMeans(combined_rmse_cpi, na.rm=TRUE))
+combined_mean_mae_fedfunds <- colMeans(combined_mae_fedfunds, na.rm=TRUE)
+combined_mean_rmse_fedfunds <- sqrt(colMeans(combined_rmse_fedfunds, na.rm=TRUE))
+
+# Total iterations and transition point
+total_iterations <- max_pre_iterations + intervention_iterations
+transition_point <- max_pre_iterations + 0.5  # Midpoint for vertical line
+
+cat("Combined cross-validation summary:\n")
+cat("Pre-intervention iterations:", max_pre_iterations, "\n")
+cat("Intervention iterations:", intervention_iterations, "\n")
+cat("Total combined iterations:", total_iterations, "\n")
+cat("Transition point at iteration:", transition_point, "\n")
+
+# Summary statistics
+cat("\nCombined performance metrics:\n")
+cat("Mean AIC (Pre-intervention):", round(mean(aic_pre), 2), "| (Intervention):", round(mean(aic_intervention), 2), "\n")
+cat("Mean BIC (Pre-intervention):", round(mean(bic_pre), 2), "| (Intervention):", round(mean(bic_intervention), 2), "\n")
+cat("Mean Adj R² CPI (Pre):", round(mean(adj_r2_pre_cpi), 3), "| (Intervention):", round(mean(adj_r2_intervention_cpi), 3), "\n")
+cat("Mean Adj R² FedFunds (Pre):", round(mean(adj_r2_pre_fedfunds), 3), "| (Intervention):", round(mean(adj_r2_intervention_fedfunds), 3), "\n")
+
+# Create combined plots
+par(mfrow=c(3,3))
+
+# Row 1: Combined MAE vs forecast horizon
+plot(1:H, combined_mean_mae_cpi, type="l", col="blue", lwd=2, 
+     main="Combined MAE vs Forecast Horizon", xlab="Horizon", ylab="MAE",
+     ylim=range(c(combined_mean_mae_cpi, combined_mean_mae_fedfunds)))
+lines(1:H, combined_mean_mae_fedfunds, col="red", lwd=2)
+
+# Row 1: Combined RMSE vs forecast horizon
+plot(1:H, combined_mean_rmse_cpi, type="l", col="blue", lwd=2,
+     main="Combined RMSE vs Forecast Horizon", xlab="Horizon", ylab="RMSE",
+     ylim=range(c(combined_mean_rmse_cpi, combined_mean_rmse_fedfunds)))
+lines(1:H, combined_mean_rmse_fedfunds, col="red", lwd=2)
+
+# Row 1: Leave blank (placeholder)
+plot.new()
+
+# Row 2: Combined AIC vs iteration number with transition line and upper bound label
+plot(seq_along(combined_aic), combined_aic, type="l", col="green", lwd=2,
+     main="Combined AIC vs Iteration", xlab="Iteration", ylab="AIC")
+abline(v=transition_point, col="black", lty=2, lwd=2)
+text(transition_point + 5, max(combined_aic, na.rm=TRUE) * 0.95, "Baseline → Intervention", adj=0, cex=0.8)
+text(length(combined_aic) * 0.8, max(combined_aic, na.rm=TRUE) * 0.85, 
+     paste("Max:", round(max(combined_aic, na.rm=TRUE), 1)), adj=0, cex=0.8)
+
+# Row 2: Combined BIC vs iteration number with transition line and upper bound label
+plot(seq_along(combined_bic), combined_bic, type="l", col="orange", lwd=2,
+     main="Combined BIC vs Iteration", xlab="Iteration", ylab="BIC")
+abline(v=transition_point, col="black", lty=2, lwd=2)
+text(transition_point + 5, max(combined_bic, na.rm=TRUE) * 0.95, "Baseline → Intervention", adj=0, cex=0.8)
+text(length(combined_bic) * 0.8, max(combined_bic, na.rm=TRUE) * 0.85, 
+     paste("Max:", round(max(combined_bic, na.rm=TRUE), 1)), adj=0, cex=0.8)
+
+# Row 2: Legend for all plots - formatted to show all variables clearly
+plot.new()
+legend("center", legend=c("CPI", "FedFunds"), 
+       col=c("blue", "red"), lwd=3, cex=1.0, 
+       ncol=1, bty="n", x.intersp=0.5, y.intersp=0.8)
+
+# Row 3: Combined MAE by iteration (1-step ahead) with transition line
+combined_mae_1step_cpi <- c(mae_pre_cpi[,1], mae_intervention_cpi[,1])
+combined_mae_1step_fedfunds <- c(mae_pre_fedfunds[,1], mae_intervention_fedfunds[,1])
+plot(seq_along(combined_mae_1step_cpi), combined_mae_1step_cpi, type="l", col="blue", lwd=2,
+     main="Combined MAE (1-step) vs Iteration", xlab="Iteration", ylab="MAE",
+     ylim=range(c(combined_mae_1step_cpi, combined_mae_1step_fedfunds)))
+lines(seq_along(combined_mae_1step_fedfunds), combined_mae_1step_fedfunds, col="red", lwd=2)
+abline(v=transition_point, col="black", lty=2, lwd=2)
+text(transition_point + 5, max(combined_mae_1step_cpi, na.rm=TRUE) * 0.95, "Baseline → Intervention", adj=0, cex=0.8)
+
+# Row 3: Combined RMSE by iteration (1-step ahead) with transition line
+combined_rmse_1step_cpi <- c(sqrt(rmse_pre_cpi[,1]), sqrt(rmse_intervention_cpi[,1]))
+combined_rmse_1step_fedfunds <- c(sqrt(rmse_pre_fedfunds[,1]), sqrt(rmse_intervention_fedfunds[,1]))
+plot(seq_along(combined_rmse_1step_cpi), combined_rmse_1step_cpi, type="l", col="blue", lwd=2,
+     main="Combined RMSE (1-step) vs Iteration", xlab="Iteration", ylab="RMSE",
+     ylim=range(c(combined_rmse_1step_cpi, combined_rmse_1step_fedfunds)))
+lines(seq_along(combined_rmse_1step_fedfunds), combined_rmse_1step_fedfunds, col="red", lwd=2)
+abline(v=transition_point, col="black", lty=2, lwd=2)
+text(transition_point + 5, max(combined_rmse_1step_cpi, na.rm=TRUE) * 0.95, "Baseline → Intervention", adj=0, cex=0.8)
+
+# Row 3: Combined Adjusted R² vs iteration with transition line
+plot(seq_along(combined_adj_r2_cpi), combined_adj_r2_cpi, type="l", col="blue", lwd=2,
+     main="Combined Adjusted R² vs Iteration", xlab="Iteration", ylab="Adjusted R²",
+     ylim=range(c(combined_adj_r2_cpi, combined_adj_r2_fedfunds)))
+lines(seq_along(combined_adj_r2_fedfunds), combined_adj_r2_fedfunds, col="red", lwd=2)
+abline(v=transition_point, col="black", lty=2, lwd=2)
+text(transition_point + 5, max(combined_adj_r2_cpi, na.rm=TRUE) * 0.95, "Baseline → Intervention", adj=0, cex=0.8)
+
+
+```
+
+```{r step_9_summary, fig.height=8}
+# Model comparison summary plot with increased height
+par(pin=c(7, 8))  # Set plot dimensions: width=7, height=8 inches
+plot.new()
+text(0.5, 0.9, "Combined Model Performance Summary", font=2, cex=1.2)
+
+# Pre-intervention summary
+text(0.25, 0.8, "Pre-Intervention (Baseline)", font=2, cex=1, col="blue")
+text(0.05, 0.75, paste("Iterations:", max_pre_iterations), adj=0, cex=0.9)
+text(0.05, 0.7, paste("AIC:", round(mean(aic_pre), 1), "[", round(min(aic_pre), 1), "-", round(max(aic_pre), 1), "]"), adj=0, cex=0.8)
+text(0.05, 0.65, paste("BIC:", round(mean(bic_pre), 1), "[", round(min(bic_pre), 1), "-", round(max(bic_pre), 1), "]"), adj=0, cex=0.8)
+text(0.05, 0.6, paste("R² CPI:", round(mean(adj_r2_pre_cpi), 3), "[", round(min(adj_r2_pre_cpi), 3), "-", round(max(adj_r2_pre_cpi), 3), "]"), adj=0, cex=0.8)
+text(0.05, 0.55, paste("R² FF:", round(mean(adj_r2_pre_fedfunds), 3), "[", round(min(adj_r2_pre_fedfunds), 3), "-", round(max(adj_r2_pre_fedfunds), 3), "]"), adj=0, cex=0.8)
+text(0.05, 0.5, paste("MAE CPI:", round(mean(mean_mae_pre_cpi), 3), "[", round(min(mean_mae_pre_cpi), 3), "-", round(max(mean_mae_pre_cpi), 3), "]"), adj=0, cex=0.8)
+text(0.05, 0.45, paste("RMSE CPI:", round(mean(mean_rmse_pre_cpi), 3), "[", round(min(mean_rmse_pre_cpi), 3), "-", round(max(mean_rmse_pre_cpi), 3), "]"), adj=0, cex=0.8)
+
+# Intervention summary
+text(0.75, 0.8, "Intervention Period", font=2, cex=1, col="red")
+text(0.55, 0.75, paste("Iterations:", intervention_iterations), adj=0, cex=0.9)
+text(0.55, 0.7, paste("AIC:", round(mean(aic_intervention), 1), "[", round(min(aic_intervention), 1), "-", round(max(aic_intervention), 1), "]"), adj=0, cex=0.8)
+text(0.55, 0.65, paste("BIC:", round(mean(bic_intervention), 1), "[", round(min(bic_intervention), 1), "-", round(max(bic_intervention), 1), "]"), adj=0, cex=0.8)
+text(0.55, 0.6, paste("R² CPI:", round(mean(adj_r2_intervention_cpi), 3), "[", round(min(adj_r2_intervention_cpi), 3), "-", round(max(adj_r2_intervention_cpi), 3), "]"), adj=0, cex=0.8)
+text(0.55, 0.55, paste("R² FF:", round(mean(adj_r2_intervention_fedfunds), 3), "[", round(min(adj_r2_intervention_fedfunds), 3), "-", round(max(adj_r2_intervention_fedfunds), 3), "]"), adj=0, cex=0.8)
+text(0.55, 0.5, paste("MAE CPI:", round(mean(mean_mae_intervention_cpi), 3), "[", round(min(mean_mae_intervention_cpi), 3), "-", round(max(mean_mae_intervention_cpi), 3), "]"), adj=0, cex=0.8)
+text(0.55, 0.45, paste("RMSE CPI:", round(mean(mean_rmse_intervention_cpi), 3), "[", round(min(mean_rmse_intervention_cpi), 3), "-", round(max(mean_rmse_intervention_cpi), 3), "]"), adj=0, cex=0.8)
+
+# Overall combined averages and ranges
+text(0.5, 0.35, "Overall Performance", font=2, cex=1.1, col="darkgreen")
+text(0.05, 0.31, paste("Mean AIC:", round(mean(combined_aic), 1), "[", round(min(combined_aic), 1), "-", round(max(combined_aic), 1), "]"), adj=0, cex=0.9)
+text(0.05, 0.28, paste("Mean BIC:", round(mean(combined_bic), 1), "[", round(min(combined_bic), 1), "-", round(max(combined_bic), 1), "]"), adj=0, cex=0.9)
+text(0.05, 0.25, paste("Mean MAE CPI:", round(mean(combined_mean_mae_cpi), 3), "[", round(min(combined_mean_mae_cpi), 3), "-", round(max(combined_mean_mae_cpi), 3), "]"), adj=0, cex=0.9)
+text(0.05, 0.22, paste("Mean RMSE CPI:", round(mean(combined_mean_rmse_cpi), 3), "[", round(min(combined_mean_rmse_cpi), 3), "-", round(max(combined_mean_rmse_cpi), 3), "]"), adj=0, cex=0.9)
+text(0.05, 0.19, paste("Mean R² CPI:", round(mean(combined_adj_r2_cpi), 3), "[", round(min(combined_adj_r2_cpi), 3), "-", round(max(combined_adj_r2_cpi), 3), "]"), adj=0, cex=0.9)
+text(0.05, 0.16, paste("Mean R² FF:", round(mean(combined_adj_r2_fedfunds), 3), "[", round(min(combined_adj_r2_fedfunds), 3), "-", round(max(combined_adj_r2_fedfunds), 3), "]"), adj=0, cex=0.9)
+
+text(0.5, 0.07, paste("Total Periods Analyzed:", total_iterations, "| Transition at:", round(transition_point)), adj=0.5, cex=0.9)
+```
+
+
+
+#### **Step 10**
+**Forecast on test data**
+```{r step_10}
+# ============================================================================
+# FORECAST ON TEST DATA
+# ============================================================================
+# Best model from overall analysis
+final_model <- var_model_aic_intervention
+
+# Define test data as time series
+ts_test <- ts(test_data_final[, c("CPI", "FedFunds")],
+              start = c(year(test_data_final$Date[1]), month(test_data_final$Date[1])),
+              frequency = 12)
+
+# Define forecast horizon based on test data length
+H_test <- nrow(test_data_final)
+
+# Create intervention variable for the test period
+test_dates <- as.numeric(as.yearmon(test_data_final$Date))
+intervention_start_num_test <- as.numeric(as.yearmon(intervention_start_date))
+intervention_end_num_test <- as.numeric(as.yearmon(intervention_end_date))
+forecast_intervention_test <- ifelse(test_dates >= intervention_start_num_test &
+                                    test_dates <= intervention_end_num_test, 1, 0)
+
+# Forecast on test data using the final_model and the intervention variable
+fcast_final <- predict(final_model, n.ahead = H_test,
+                       dumvar = matrix(forecast_intervention_test, ncol = 1),
+                       ci = 0.95) # Request 95% confidence intervals
+
+# Extract forecasts and confidence intervals
+# CPI forecasts
+fcast_cpi_test <- as.numeric(fcast_final[["fcst"]][["CPI"]][,"fcst"])
+lower_cpi_test <- as.numeric(fcast_final[["fcst"]][["CPI"]][,"lower"])
+upper_cpi_test <- as.numeric(fcast_final[["fcst"]][["CPI"]][,"upper"])
+
+# FedFunds forecasts
+fcast_fedfunds_test <- as.numeric(fcast_final[["fcst"]][["FedFunds"]][,"fcst"])
+lower_fedfunds_test <- as.numeric(fcast_final[["fcst"]][["FedFunds"]][,"lower"])
+upper_fedfunds_test <- as.numeric(fcast_final[["fcst"]][["FedFunds"]][,"upper"])
+
+# Extract actual values from test set
+actual_cpi_test <- as.numeric(test_data_final$CPI)
+actual_fedfunds_test <- as.numeric(test_data_final$FedFunds)
+
+# Calculate RMSE and MAE on the test set for transformed variables
+rmse_cpi_transformed <- sqrt(mean((fcast_cpi_test - actual_cpi_test)^2, na.rm = TRUE))
+mae_cpi_transformed <- mean(abs(fcast_cpi_test - actual_cpi_test), na.rm = TRUE)
+
+rmse_fedfunds_transformed <- sqrt(mean((fcast_fedfunds_test - actual_fedfunds_test)^2, na.rm = TRUE))
+mae_fedfunds_transformed <- mean(abs(fcast_fedfunds_test - actual_fedfunds_test), na.rm = TRUE)
+
+cat("\nPerformance on Transformed Test Data:\n")
+cat("  CPI - RMSE:", round(rmse_cpi_transformed, 4), "| MAE:", round(mae_cpi_transformed, 4), "\n")
+cat("  FedFunds - RMSE:", round(rmse_fedfunds_transformed, 4), "| MAE:", round(mae_fedfunds_transformed, 4), "\n")
+
+# ============================================================================
+# INVERT TRANSFORMATIONS AND EVALUATE ON ORIGINAL SCALE
+# ============================================================================
+# CPI: Invert first difference (cumsum) and then log (exp)
+# Need the last value of log_CPI from the training set to invert the first difference
+last_log_cpi_train <- log(data$CPI[last_train_index])
+
+# Invert transformed CPI forecasts and actuals
+inverted_fcast_cpi <- exp(cumsum(fcast_cpi_test) + last_log_cpi_train)
+inverted_actual_cpi <- exp(cumsum(actual_cpi_test) + last_log_cpi_train)
+
+# Invert CPI confidence intervals (approximate due to non-linearity of exp)
+inverted_lower_cpi <- exp(cumsum(lower_cpi_test) + last_log_cpi_train)
+inverted_upper_cpi <- exp(cumsum(upper_cpi_test) + last_log_cpi_train)
+
+# FedFunds: Invert first difference (cumsum)
+# Need the last value of FedFunds from the training set to invert the first difference
+last_fedfunds_train <- data$FedFunds[last_train_index]
+
+# Invert transformed FedFunds forecasts and actuals
+inverted_fcast_fedfunds <- cumsum(fcast_fedfunds_test) + last_fedfunds_train
+inverted_actual_fedfunds <- cumsum(actual_fedfunds_test) + last_fedfunds_train
+
+# Invert FedFunds confidence intervals
+inverted_lower_fedfunds <- cumsum(lower_fedfunds_test) + last_fedfunds_train
+inverted_upper_fedfunds <- cumsum(upper_fedfunds_test) + last_fedfunds_train
+
+# Calculate RMSE and MAE on the original scale
+rmse_cpi_original <- sqrt(mean((inverted_fcast_cpi - inverted_actual_cpi)^2, na.rm = TRUE))
+mae_cpi_original <- mean(abs(inverted_fcast_cpi - inverted_actual_cpi), na.rm = TRUE)
+
+rmse_fedfunds_original <- sqrt(mean((inverted_fcast_fedfunds - inverted_actual_fedfunds)^2, na.rm = TRUE))
+mae_fedfunds_original <- mean(abs(inverted_fcast_fedfunds - inverted_actual_fedfunds), na.rm = TRUE)
+
+cat("\nPerformance on Original Scale Test Data:\n")
+cat("  CPI - RMSE:", round(rmse_cpi_original, 4), "| MAE:", round(mae_cpi_original, 4), "\n")
+cat("  FedFunds - RMSE:", round(rmse_fedfunds_original, 4), "| MAE:", round(mae_fedfunds_original, 4), "\n")
+
+# ============================================================================
+# PLOT ORIGINAL SERIES, FORECASTS, AND CONFIDENCE INTERVALS
+# ============================================================================
+# Combine original CPI data for plotting
+all_cpi_dates <- data$Date
+all_cpi_values <- data$CPI
+
+# Combine original FedFunds data for plotting
+all_fedfunds_dates <- data$Date
+all_fedfunds_values <- data$FedFunds
+
+# Plot CPI
+par(mfrow = c(2, 1), mar = c(4, 4, 2, 2) + 0.1) # Adjust margins
+
+plot(all_cpi_dates, all_cpi_values, type = "l", col = "darkgreen", lwd = 2,
+     main = "CPI: Actuals, Forecasts and 95% CI", xlab = "Date", ylab = "CPI",
+     xlim = range(c(all_cpi_dates, test_data_final$Date)),
+     ylim = range(c(all_cpi_values, inverted_lower_cpi, inverted_upper_cpi), na.rm = TRUE))
+
+# Add training/test split line
+abline(v = split_date, col = "purple", lty = 2, lwd = 2)
+text(split_date, par("usr")[4], "Train | Test Split", col = "purple", pos = 4, offset = 0.5, cex = 0.8)
+
+# Add inverted forecasts and CIs for CPI
+lines(test_data_final$Date, inverted_fcast_cpi, col = "blue", lwd = 2)
+lines(test_data_final$Date, inverted_lower_cpi, col = "skyblue", lty = 2, lwd = 1.5)
+lines(test_data_final$Date, inverted_upper_cpi, col = "skyblue", lty = 2, lwd = 1.5)
+
+legend("topleft", legend = c("Actual CPI", "Forecasted CPI", "95% CI"), 
+       col = c("darkgreen", "blue", "skyblue"), lty = c(1, 1, 2), lwd = c(2, 2, 1.5))
+
+# Plot FedFunds
+plot(all_fedfunds_dates, all_fedfunds_values, type = "l", col = "darkgreen", lwd = 2,
+     main = "Federal Funds Rate: Actuals, Forecasts and 95% CI", xlab = "Date", ylab = "Fed Funds Rate (%)",
+     xlim = range(c(all_fedfunds_dates, test_data_final$Date)),
+     ylim = range(c(all_fedfunds_values, inverted_lower_fedfunds, inverted_upper_fedfunds), na.rm = TRUE))
+
+# Add training/test split line
+abline(v = split_date, col = "purple", lty = 2, lwd = 2)
+text(split_date, par("usr")[4], "Train | Test Split", col = "purple", pos = 4, offset = 0.5, cex = 0.8)
+
+# Add inverted forecasts and CIs for FedFunds
+lines(test_data_final$Date, inverted_fcast_fedfunds, col = "blue", lwd = 2)
+lines(test_data_final$Date, inverted_lower_fedfunds, col = "skyblue", lty = 2, lwd = 1.5)
+lines(test_data_final$Date, inverted_upper_fedfunds, col = "skyblue", lty = 2, lwd = 1.5)
+
+legend("topleft", legend = c("Actual FedFunds", "Forecasted FedFunds", "95% CI"), 
+       col = c("darkgreen", "blue", "skyblue"), lty = c(1, 1, 2), lwd = c(2, 2, 1.5))
+```
+
